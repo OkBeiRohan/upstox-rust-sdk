@@ -17,6 +17,9 @@ pub(super) const INSTRUMENTS_COMPLETE_URL: &str =
     "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz";
 
 pub(super) const USER_GET_FUND_AND_MARGIN_ENDPOINT: &str = "/user/get-funds-and-margin";
+/// V3 funds/margin endpoint (2026-04-10). Same path as V2 — the SDK
+/// differentiates by calling `create_url` with `APIVersion::V3`.
+pub(super) const USER_GET_FUND_AND_MARGIN_V3_ENDPOINT: &str = "/user/get-funds-and-margin";
 pub(super) const USER_GET_PROFILE_ENDPOINT: &str = "/user/profile";
 
 pub(super) const CHARGES_BROKERAGE_DETAILS_ENDPOINT: &str = "/charges/brokerage";
@@ -85,8 +88,47 @@ pub(super) const UPSTOX_ACCESS_TOKEN_FILENAME: &str = "access_token.txt";
 pub(super) const INSTRUMENTS_ARCHIVE_FILENAME: &str = "complete.json.gz";
 pub(super) const INSTRUMENTS_JSON_FILENAME: &str = "complete.json";
 
+// ---------------------------------------------------------------------------
+// Rate-limit bucket constants (Upstox Uplink REST).
+//
+// Source (verified 2026-04-20):
+// https://upstox.com/developer/api-documentation/rate-limiting
+//
+// The legacy `RATE_LIMIT_PER_*` constants (pre-v2) are retained as
+// `#[deprecated]` aliases below for one release so external users with
+// custom `ApiRateLimiter::new(_, _, _)` calls still compile — the new
+// `ApiRateLimiter::new(RateLimitProfile)` constructor consumes the new
+// values and ignores the legacy triple entirely.
+// ---------------------------------------------------------------------------
+
+/// Combined order-placement bucket — per-second cap for non-SEBI-registered
+/// algos. Applies to `/order/place`, `/order/modify`, `/order/cancel`,
+/// `/order/multi/*`, `/order/positions/exit`, and `/order/gtt/{place,modify,cancel}`.
+pub const ORDER_BUCKET_PER_SECOND_REGULAR: usize = 10;
+/// Combined order-placement bucket — per-second cap for SEBI-registered algos.
+pub const ORDER_BUCKET_PER_SECOND_SEBI: usize = 50;
+/// Combined order-placement bucket — per-minute cap (both profiles).
+pub const ORDER_BUCKET_PER_MINUTE: usize = 500;
+/// Combined order-placement bucket — per-30-minute cap (both profiles).
+pub const ORDER_BUCKET_PER_30_MINUTES: usize = 2000;
+
+/// Standard read/account bucket — per-second cap.
+pub const STANDARD_BUCKET_PER_SECOND: usize = 50;
+/// Standard read/account bucket — per-minute cap.
+pub const STANDARD_BUCKET_PER_MINUTE: usize = 500;
+/// Standard read/account bucket — per-30-minute cap.
+pub const STANDARD_BUCKET_PER_30_MINUTES: usize = 2000;
+
+#[deprecated(note = "Use the bucket-specific constants (ORDER_BUCKET_* / STANDARD_BUCKET_*). The \
+                     pre-v2 SDK modelled limits per-endpoint with a flat (25, 250, 1000) bucket \
+                     which does not match Upstox's combined-bucket reality.")]
+#[allow(dead_code)]
 pub(super) const RATE_LIMIT_PER_SECOND: usize = 25;
+#[deprecated(note = "Use the bucket-specific constants (ORDER_BUCKET_* / STANDARD_BUCKET_*).")]
+#[allow(dead_code)]
 pub(super) const RATE_LIMIT_PER_MINUTE: usize = 250;
+#[deprecated(note = "Use the bucket-specific constants (ORDER_BUCKET_* / STANDARD_BUCKET_*).")]
+#[allow(dead_code)]
 pub(super) const RATE_LIMIT_PER_THIRTY_MINUTES: usize = 1000;
 
 pub(super) const EMAIL_ID_ENV: &str = "EMAIL_ID";

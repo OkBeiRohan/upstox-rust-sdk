@@ -1,6 +1,6 @@
 [package]
 name = "upstox-rust-sdk"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2024"
 authors = ["Aviral Omar", "aviralomar0301@gmail.com"]
 categories = ["api-bindings", "asynchronous"]

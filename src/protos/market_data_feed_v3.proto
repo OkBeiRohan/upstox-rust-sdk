@@ -55,7 +55,7 @@ message MarketFullFeed{
   double atp = 5; //avg traded price
   int64 vtt = 6; //volume traded today
   double oi = 7; //open interest
-  double iv = 8; //implied volatility
+  double iv = 8; //implied volatility 
   double tbq =9; //total buy quantity
   double tsq = 10; //total sell quantity
 }
@@ -79,7 +79,7 @@ message FirstLevelWithGreeks{
   OptionGreeks optionGreeks = 3;
   int64 vtt = 4; //volume traded today
   double oi = 5; //open interest
-  double iv = 6; //implied volatility
+  double iv = 6; //implied volatility 
 }
 
 message Feed {

@@ -25,6 +25,32 @@ use {
     },
 };
 
+/// Validator for the `market_protection` field that is optional across
+/// the Place / Modify / Multi / ExitAll / GTT order paths (Upstox
+/// announcement of 2026-03-11).
+///
+/// Accepted values:
+/// - `None` — field omitted; broker applies its default.
+/// - `Some(-1)` — automatic price protection (broker decides).
+/// - `Some(0)` — explicitly no protection (Upstox's table includes 0
+///   for symmetry but the exchange will reject the naked MARKET /
+///   SL-M order downstream).
+/// - `Some(1..=25)` — custom protection percent.
+///
+/// Reference: <https://upstox.com/developer/api-documentation/announcements/market-protection>
+pub fn validate_market_protection(
+    value: &Option<i32>,
+) -> Result<(), serde_valid::validation::Error> {
+    match value {
+        None => Ok(()),
+        Some(-1) => Ok(()),
+        Some(v) if (0..=25).contains(v) => Ok(()),
+        Some(v) => Err(serde_valid::validation::Error::Custom(format!(
+            "market_protection must be -1 (auto), 0 (none), or 1..=25 (percent); got {v}"
+        ))),
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ResponseSummary {
     pub total: u32,
@@ -84,8 +110,15 @@ pub enum SegmentType {
     MF,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(rename_all = "UPPERCASE")]
+/// An Upstox exchange code.
+///
+/// Permissive by design: Upstox periodically introduces new exchange
+/// codes (e.g. `NSCOM` added in April 2026) and the SDK must decode them
+/// without panicking. Unknown values land in [`Exchange::Other`] so the
+/// raw string is preserved for diagnostic logging while still round-tripping
+/// over the wire.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(from = "String", into = "String")]
 pub enum Exchange {
     NSE,
     NFO,
@@ -94,6 +127,44 @@ pub enum Exchange {
     BFO,
     BCD,
     MCX,
+    /// NSE Commodity segment — added to the public API response set in
+    /// the April 2026 Upstox docs rollout.
+    NSCOM,
+    /// Any exchange code not known to this SDK build. The raw string
+    /// is preserved verbatim for log output and `to_string()` comparisons.
+    Other(String),
+}
+
+impl From<String> for Exchange {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "NSE" => Exchange::NSE,
+            "NFO" => Exchange::NFO,
+            "CDS" => Exchange::CDS,
+            "BSE" => Exchange::BSE,
+            "BFO" => Exchange::BFO,
+            "BCD" => Exchange::BCD,
+            "MCX" => Exchange::MCX,
+            "NSCOM" => Exchange::NSCOM,
+            _ => Exchange::Other(s),
+        }
+    }
+}
+
+impl From<Exchange> for String {
+    fn from(e: Exchange) -> String {
+        match e {
+            Exchange::NSE => "NSE".to_string(),
+            Exchange::NFO => "NFO".to_string(),
+            Exchange::CDS => "CDS".to_string(),
+            Exchange::BSE => "BSE".to_string(),
+            Exchange::BFO => "BFO".to_string(),
+            Exchange::BCD => "BCD".to_string(),
+            Exchange::MCX => "MCX".to_string(),
+            Exchange::NSCOM => "NSCOM".to_string(),
+            Exchange::Other(s) => s,
+        }
+    }
 }
 
 impl Display for Exchange {
@@ -106,6 +177,8 @@ impl Display for Exchange {
             Exchange::BFO => "BFO",
             Exchange::BCD => "BCD",
             Exchange::MCX => "MCX",
+            Exchange::NSCOM => "NSCOM",
+            Exchange::Other(s) => s,
         };
         write!(f, "{}", s)
     }
@@ -210,5 +283,45 @@ impl<'de> Deserialize<'de> for OrderStatus {
         D: Deserializer<'de>,
     {
         serde_spaced_lowercase::deserialize(deserializer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exchange_round_trips_known_variants() {
+        for name in ["NSE", "NFO", "CDS", "BSE", "BFO", "BCD", "MCX", "NSCOM"] {
+            let wire = format!("\"{name}\"");
+            let de: Exchange =
+                serde_json::from_str(&wire).expect("known Exchange variant deserializes");
+            let ser = serde_json::to_string(&de).expect("Exchange serializes");
+            assert_eq!(ser, wire, "round-trip drift for {name}");
+            assert_eq!(de.to_string(), name, "Display drift for {name}");
+        }
+    }
+
+    /// Regression for the April 2026 `NSCOM` incident and every future
+    /// one: an unrecognised exchange value must NOT panic deserialization.
+    #[test]
+    fn exchange_preserves_unknown_values_verbatim() {
+        let raw = "\"SOMETHING_NEW_TOMORROW\"";
+        let de: Exchange = serde_json::from_str(raw).expect("unknown value must not panic");
+        assert_eq!(de, Exchange::Other("SOMETHING_NEW_TOMORROW".to_string()));
+        // Round-trip preserves the string exactly.
+        let ser = serde_json::to_string(&de).unwrap();
+        assert_eq!(ser, raw);
+        // Display path keeps existing `eq_ignore_ascii_case(...)` consumers
+        // working without any SDK-level string manipulation.
+        assert_eq!(de.to_string(), "SOMETHING_NEW_TOMORROW");
+    }
+
+    #[test]
+    fn exchange_other_is_case_sensitive_and_exact() {
+        let de: Exchange = serde_json::from_str("\"nse\"").unwrap();
+        // Unlike the closed enum, we do NOT coerce the case here —
+        // callers decide whether to normalise.
+        assert_eq!(de, Exchange::Other("nse".to_string()));
     }
 }

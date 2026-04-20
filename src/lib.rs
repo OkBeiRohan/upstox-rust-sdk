@@ -11,3 +11,13 @@ pub mod protos;
 pub mod rate_limiter;
 mod utils;
 pub mod ws_client;
+
+// Convenience re-exports so callers can `use upstox_rust_sdk::{WsConnectionRole, ...};`
+// without walking the module tree.
+pub use client::ClientCapabilities;
+pub use rate_limiter::{RateLimitBucket, RateLimitExceeded, RateLimitProfile};
+pub use ws_client::{
+    ALL_WS_CONNECTION_ROLES, MAX_MARKET_DATA_CONNECTIONS, MAX_MARKET_DATA_CONNECTIONS_STANDARD,
+    MarketDataFeedV3CallbackBox, MarketDataFeedV3ClientPool, MarketDataFeedV3EzClient,
+    MarketDataV3Call, WsConnectionId, WsConnectionRole,
+};

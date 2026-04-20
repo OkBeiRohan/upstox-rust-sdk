@@ -30,6 +30,11 @@ impl ApiClient {
         &self,
         expiries_params: ExpiriesRequest,
     ) -> Result<Result<SuccessResponse<Vec<String>>, ErrorResponse>, RateLimitExceeded> {
+        // Expired-instruments APIs are Plus-only (Upstox announcement
+        // 2025-05-13). Refuse up-front on the standard tier so
+        // operators see a typed error rather than a silent
+        // 4xx / empty-response pair from the broker.
+        self.ensure_plus_user("expired-instruments/expiries")?;
         expiries_params.validate().unwrap();
 
         let res: reqwest::Response = self
@@ -55,6 +60,7 @@ impl ApiClient {
         Result<SuccessResponse<Vec<OptionContractsResponse>>, ErrorResponse>,
         RateLimitExceeded,
     > {
+        self.ensure_plus_user("expired-instruments/option-contract")?;
         expired_option_contracts_params.validate().unwrap();
 
         let res: reqwest::Response = self
@@ -83,6 +89,7 @@ impl ApiClient {
         Result<SuccessResponse<Vec<ExpiredFutureContractsResponse>>, ErrorResponse>,
         RateLimitExceeded,
     > {
+        self.ensure_plus_user("expired-instruments/future-contract")?;
         expired_future_contracts_params.validate().unwrap();
 
         let res: reqwest::Response = self
@@ -108,6 +115,7 @@ impl ApiClient {
         &self,
         expired_historical_candles_path_params: ExpiredHistoricalCandleDataRequest,
     ) -> Result<Result<SuccessResponse<CandleDataResponse>, ErrorResponse>, RateLimitExceeded> {
+        self.ensure_plus_user("expired-instruments/historical-candle")?;
         expired_historical_candles_path_params.validate().unwrap();
 
         let res: reqwest::Response = self

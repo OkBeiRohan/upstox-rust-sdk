@@ -2,6 +2,10 @@ use {crate::models::orders::ExchangeSegment, serde::Serialize, serde_valid::Vali
 
 #[derive(Serialize, Debug, Validate)]
 pub struct CancelMultiOrderRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub segment: Option<ExchangeSegment>,
-    pub taget: Option<String>,
+    /// Filter open orders by the caller-supplied order tag (the same
+    /// value passed as `tag` in the original `PlaceOrderV3Request`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }

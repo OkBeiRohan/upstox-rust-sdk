@@ -6,7 +6,7 @@ pub mod modify_gtt_order_request;
 pub mod place_gtt_order_request;
 
 use {
-    crate::models::{ProductType, TransactionType},
+    crate::models::{validate_market_protection, ProductType, TransactionType},
     serde::{Deserialize, Serialize},
     serde_valid::{Validate, validation::Error},
 };
@@ -54,6 +54,12 @@ pub struct GTTOrderRule {
     )]
     pub trigger_price: f64,
     pub trailing_gap: Option<f64>,
+    /// See
+    /// [`crate::models::orders::place_order_v3_request::PlaceOrderV3Request::market_protection`].
+    /// Applied per-rule by Upstox (2026-03-11 announcement).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(validate_market_protection))]
+    pub market_protection: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -66,6 +72,9 @@ pub struct GTTOrderDetailsRule {
     pub message: String,
     pub order_id: Option<String>,
     pub trailing_gap: Option<f64>,
+    /// See [`GTTOrderRule::market_protection`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_protection: Option<i32>,
 }
 
 fn validate_trailing_gap(

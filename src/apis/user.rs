@@ -1,7 +1,8 @@
 use crate::{
     client::ApiClient,
     constants::{
-        APIVersion, BaseUrlType, USER_GET_FUND_AND_MARGIN_ENDPOINT, USER_GET_PROFILE_ENDPOINT,
+        APIVersion, BaseUrlType, USER_GET_FUND_AND_MARGIN_ENDPOINT,
+        USER_GET_FUND_AND_MARGIN_V3_ENDPOINT, USER_GET_PROFILE_ENDPOINT,
     },
     models::{
         error_response::ErrorResponse,
@@ -9,6 +10,7 @@ use crate::{
         user::{
             fund_and_margin_request::{FundAndMarginRequest, SegmentType},
             fund_and_margin_response::FundAndMarginResponse,
+            fund_and_margin_v3_response::FundAndMarginV3Response,
             profile_response::ProfileResponse,
         },
     },
@@ -38,6 +40,12 @@ impl ApiClient {
         })
     }
 
+    #[deprecated(
+        note = "Use `get_fund_and_margin_v3` — the V2 response shape changed on \
+                2025-07-19 (combined equity+commodity surfaced in the `equity` \
+                object, `commodity` kept but zeroed) and the V3 endpoint exposes \
+                the cash/pledge split the 2026-04-10 rollout added."
+    )]
     pub async fn get_fund_and_margin(
         &self,
         segment: Option<SegmentType>,
@@ -58,6 +66,34 @@ impl ApiClient {
         Ok(match res.status().as_u16() {
             200 => Ok(res
                 .json::<SuccessResponse<FundAndMarginResponse>>()
+                .await
+                .unwrap()),
+            _ => Err(res.json::<ErrorResponse>().await.unwrap()),
+        })
+    }
+
+    /// V3 Get Fund and Margin (2026-04-10). No `segment` parameter; the
+    /// response exposes a nested `available_to_trade.{cash,pledge}` split
+    /// plus `unavailable_to_trade.*` margin breakdown.
+    ///
+    /// Reference: <https://upstox.com/developer/api-documentation/announcements/get-funds-and-margin-v3/>
+    pub async fn get_fund_and_margin_v3(
+        &self,
+    ) -> Result<Result<SuccessResponse<FundAndMarginV3Response>, ErrorResponse>, RateLimitExceeded>
+    {
+        let res: reqwest::Response = self
+            .get(
+                USER_GET_FUND_AND_MARGIN_V3_ENDPOINT,
+                true,
+                None,
+                BaseUrlType::REGULAR,
+                APIVersion::V3,
+            )
+            .await?;
+
+        Ok(match res.status().as_u16() {
+            200 => Ok(res
+                .json::<SuccessResponse<FundAndMarginV3Response>>()
                 .await
                 .unwrap()),
             _ => Err(res.json::<ErrorResponse>().await.unwrap()),

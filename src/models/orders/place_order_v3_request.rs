@@ -1,7 +1,7 @@
 use {
     crate::models::{
         orders::{OrderType, ValidityType},
-        ProductType, TransactionType,
+        validate_market_protection, ProductType, TransactionType,
     },
     serde::Serialize,
     serde_valid::Validate,
@@ -19,7 +19,7 @@ pub struct PlaceOrderV3Request {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     #[validate(
-        pattern = r"^(?:^NSE_EQ|NSE_FO|NCD_FO|BSE_EQ|BSE_FO|BCD_FO|MCX_FO|NSE_INDEX|BSE_INDEX|MCX_INDEX)\|[\w ]+(,(?:NSE_EQ|NSE_FO|NCD_FO|BSE_EQ|BSE_FO|BCD_FO|MCX_FO|NSE_INDEX|BSE_INDEX|MCX_INDEX)\|[\w ]+)*?$",
+        pattern = r"^(?:^NSE_EQ|NSE_FO|NSE_COM|NCD_FO|NCD_COM|BSE_EQ|BSE_FO|BSE_COM|BCD_FO|MCX_FO|MCX_COM|NSE_INDEX|BSE_INDEX|MCX_INDEX)\|[\w ]+(,(?:NSE_EQ|NSE_FO|NSE_COM|NCD_FO|NCD_COM|BSE_EQ|BSE_FO|BSE_COM|BCD_FO|MCX_FO|MCX_COM|NSE_INDEX|BSE_INDEX|MCX_INDEX)\|[\w ]+)*?$",
         message = "Invalid instrument_token"
     )]
     pub instrument_token: String,
@@ -31,4 +31,10 @@ pub struct PlaceOrderV3Request {
     pub is_amo: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slice: Option<bool>,
+    /// Market-price protection percent (`-1` = auto, `0` = none, `1..=25`
+    /// = custom percent). Added to the API on 2026-03-11; valid only for
+    /// MARKET and SL-M order types — broker ignores on LIMIT / SL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(validate_market_protection))]
+    pub market_protection: Option<i32>,
 }

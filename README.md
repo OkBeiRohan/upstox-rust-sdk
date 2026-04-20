@@ -6,6 +6,16 @@ A Rust client for communicating with the <a href="https://upstox.com/uplink/">Up
 
 Upstox API is a set of rest APIs that provide data required to build a complete investment and trading platform. Execute orders in real time, manage user portfolio, stream live market data (using Websocket), and a lot more with this crate.
 
+### What's new in `2.0` (see `CHANGELOG.md`)
+
+- **Parallel market-data WebSocket connections** via `WsConnectionRole` / `WsConnectionId`. Up to 5 physical sockets on Upstox Plus, 2 on the standard tier — enforced by the SDK based on [`ClientCapabilities::is_plus_user`](src/client.rs).
+- **Native `full_d30` mode** — `ModeTypeV3::FullD30` with a pinned wire name and snapshot-tested subscribe envelope. Rejected at the SDK layer for non-Plus accounts.
+- **Capability-aware feature gating** — `ClientCapabilities { is_plus_user, is_sebi_registered }` fails fast with `RateLimitExceeded::FeatureRequiresPlus(...)` when non-Plus code paths attempt Plus-only APIs (extra WS slots, `full_d30`, expired-instruments endpoints).
+- **Shared-bucket rate limiter** that matches the Upstox docs (`OrderPlacement` + `Standard` buckets, 10/50 per-sec order cap depending on `RateLimitProfile::{RegularAlgo, SebiRegistered}`). No more per-endpoint `(25, 250, 1000)` fiction.
+- **Permissive `Exchange` parsing** — `NSCOM` + `Exchange::Other(String)` so future exchange codes never panic JSON decode.
+- **2026-03/04 API additions** — `market_protection` on every order request, `trailing_gap` on GTT rules, `X-Algo-Name` header auto-injected on order-bucket endpoints, `get_fund_and_margin_v3` with the nested cash/pledge split.
+- **No more hot-path panics** — `request.send().await` and `"Unsupported HTTP Method"` now surface as `RateLimitExceeded::{Network, UnsupportedMethod}` variants (the outer error enum is `#[non_exhaustive]`).
+
 ## Requirements
 - Install `libssl-dev` on Linux
 
@@ -27,10 +37,11 @@ These environment variables are used optionally in the SDK depending on the feat
 
 ## Examples
 
-- [`login-usage`](https://github.com/Aviral-Omar/upstox-rust-sdk/tree/main/examples/login_usage): Example on using login functionality to get access token, automating login, fetching OTP automatically, scheduling automatic re-login.
-- [`fetch-instruments`](https://github.com/Aviral-Omar/upstox-rust-sdk/tree/main/examples/fetch_instruments): Example on fetching available instruments on startup and refreshing them daily.
-- [`ws-usage`](https://github.com/Aviral-Omar/upstox-rust-sdk/tree/main/examples/ws_usage): Example on using websockets and passing callbacks to handle websocket data and handling app exit when using websockets.
-- [`api-usage`](https://github.com/Aviral-Omar/upstox-rust-sdk/tree/main/examples/api_usage): Example on using Upstox's REST API endpoints via the ApiClient.
+- [`login-usage`](examples/login_usage): Example on using login functionality to get access token, automating login, fetching OTP automatically, scheduling automatic re-login.
+- [`fetch-instruments`](examples/fetch_instruments): Example on fetching available instruments on startup and refreshing them daily.
+- [`ws-usage`](examples/ws_usage): Two-slot WebSocket fan-out — subscribes one slot in `Full` mode and another in `full_d30`.
+- [`ws-multi`](examples/ws_multi): Full 5-slot Upstox Plus fan-out — one physical WS per `WsConnectionRole`, each with its own subscribe batch and role-stamped callback.
+- [`api-usage`](examples/api_usage): Example on using Upstox's REST API endpoints via the ApiClient.
 
 ## License
 

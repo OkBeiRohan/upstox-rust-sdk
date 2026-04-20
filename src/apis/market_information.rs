@@ -89,14 +89,14 @@ impl ApiClient {
 
     pub async fn get_exchange_status(
         &self,
-        exchange_staus_path_params: ExchangeStatusRequest,
+        exchange_status_path_params: ExchangeStatusRequest,
     ) -> Result<Result<SuccessResponse<ExchangeStatusResponse>, ErrorResponse>, RateLimitExceeded>
     {
         let res: reqwest::Response = self
             .get(
                 format!(
                     "{}/{}",
-                    MARKET_INFO_EXCHANGE_STATUS_ENDPOINT, exchange_staus_path_params.exchange
+                    MARKET_INFO_EXCHANGE_STATUS_ENDPOINT, exchange_status_path_params.exchange
                 )
                 .as_str(),
                 true,

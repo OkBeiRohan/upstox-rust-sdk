@@ -345,10 +345,7 @@
 
 use {
     crate::{
-        constants::{
-            APIVersion, BaseUrlType, RATE_LIMIT_PER_MINUTE, RATE_LIMIT_PER_SECOND,
-            RATE_LIMIT_PER_THIRTY_MINUTES,
-        },
+        constants::{APIVersion, BaseUrlType},
         models::{
             ExchangeSegment,
             error_response::ErrorResponse,
@@ -360,10 +357,12 @@ use {
                 portfolio_feed_response::PortfolioFeedResponse,
             },
         },
-        protos::market_data_feed_v3::FeedResponse as MarketDataFeedV3Response,
-        rate_limiter::{ApiRateLimiter, RateLimitExceeded},
+        rate_limiter::{ApiRateLimiter, RateLimitExceeded, RateLimitProfile},
         utils::create_url,
-        ws_client::{MarketDataFeedV3Client, PortfolioFeedClient},
+        ws_client::{
+            MarketDataFeedV3CallbackBox, MarketDataFeedV3ClientPool, PortfolioFeedClient,
+            WsConnectionId, MAX_MARKET_DATA_CONNECTIONS,
+        },
     },
     chrono::FixedOffset,
     ezsockets::Client as EzClient,
@@ -381,20 +380,120 @@ use {
     tracing::info,
 };
 
+/// Account-level capability flags the SDK enforces at the feature
+/// boundary. Forwarded to the `ApiClient` at construction time via
+/// [`ApiClient::new_with_capabilities`].
+///
+/// Defaults (`Default::default()`) model a **non-Plus, non-SEBI**
+/// account: 2 market-data WebSocket connections, no `full_d30`, no
+/// expired-instruments endpoints, 10 orders/second peak. Flip the
+/// flags **only** when the underlying Upstox account actually has the
+/// matching entitlement — every flag changes the SDK's contract with
+/// the broker and a mis-configuration either wastes rate-limit budget
+/// or triggers silent exchange rejections.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientCapabilities {
+    /// `true` when the Upstox account is subscribed to
+    /// [Upstox Plus](https://upstox.com/developer/api-documentation/announcements/websocket-plus).
+    /// Plus unlocks:
+    ///
+    /// - Up to [`MAX_MARKET_DATA_CONNECTIONS`] = 5 market-data
+    ///   WebSocket connections (standard: `MAX_MARKET_DATA_CONNECTIONS_STANDARD` = 2).
+    /// - [`ModeTypeV3::FullD30`][crate::models::ws::market_data_feed_v3_message::ModeTypeV3::FullD30]
+    ///   subscriptions (30-level market depth).
+    /// - Expired-instruments REST endpoints (`get_expiries`,
+    ///   `get_expired_option_contracts`,
+    ///   `get_expired_future_contracts`,
+    ///   `get_expired_historical_candle_data`).
+    ///
+    /// Default `false` — Plus-only calls are rejected with
+    /// [`RateLimitExceeded::FeatureRequiresPlus`].
+    pub is_plus_user: bool,
+
+    /// `true` when the user's Upstox app is SEBI-registered as an
+    /// algo strategy. Only affects the per-second cap on the
+    /// order-placement rate-limit bucket (50/s registered vs 10/s
+    /// non-registered, per the
+    /// [rate-limiting docs](https://upstox.com/developer/api-documentation/rate-limiting)).
+    ///
+    /// Default `false` — the conservative 10/s cap applies.
+    pub is_sebi_registered: bool,
+}
+
+impl ClientCapabilities {
+    /// Short-hand for `ClientCapabilities { is_plus_user: false, is_sebi_registered: false }`.
+    pub const fn standard() -> Self {
+        Self {
+            is_plus_user: false,
+            is_sebi_registered: false,
+        }
+    }
+
+    /// Short-hand for a Plus + SEBI-registered account.
+    pub const fn plus_sebi() -> Self {
+        Self {
+            is_plus_user: true,
+            is_sebi_registered: true,
+        }
+    }
+
+    /// Which [`RateLimitProfile`] the rate limiter should run under.
+    pub const fn rate_limit_profile(self) -> RateLimitProfile {
+        if self.is_sebi_registered {
+            RateLimitProfile::SebiRegistered
+        } else {
+            RateLimitProfile::RegularAlgo
+        }
+    }
+
+    /// Max simultaneous market-data WebSockets the broker allows for
+    /// this capability set. Used by
+    /// [`ApiClient::connect_market_data_feed_v3`] to short-circuit a
+    /// bad request before it reaches Upstox.
+    pub const fn max_market_data_connections(self) -> usize {
+        if self.is_plus_user {
+            MAX_MARKET_DATA_CONNECTIONS
+        } else {
+            crate::ws_client::MAX_MARKET_DATA_CONNECTIONS_STANDARD
+        }
+    }
+}
+
 pub struct ApiClient {
     pub(crate) client: ReqwestClient,
     pub(crate) api_key: String,
     pub(crate) token: Option<String>,
+    /// Optional value for the `X-Algo-Name` header (2026-04-01 SEBI
+    /// circular). Injected on order-placement-bucket endpoints only;
+    /// leave `None` unless the Upstox app has registered algo strategies.
+    pub(crate) algo_name: Option<String>,
+    /// Account-level capability flags. Populated at construction and
+    /// never mutated afterwards (flipping `is_plus_user` mid-session
+    /// would silently drop the extra WS slots + `full_d30` subs).
+    pub(crate) capabilities: ClientCapabilities,
     pub instruments: Option<HashMap<ExchangeSegment, HashMap<String, Vec<InstrumentsResponse>>>>,
     pub portfolio_feed_client:
         Option<EzClient<PortfolioFeedClient<Box<dyn FnMut(PortfolioFeedResponse) + Send + Sync>>>>,
-    pub market_data_feed_v3_client: Option<
-        EzClient<MarketDataFeedV3Client<Box<dyn FnMut(MarketDataFeedV3Response) + Send + Sync>>>,
-    >,
+    /// Pool of up to [`MAX_MARKET_DATA_CONNECTIONS`] parallel market-data
+    /// WebSockets (Upstox Plus allows 5 per user, standard accounts 2).
+    /// Each slot is independent — typical high-frequency clients fan
+    /// out one role per slot (constituents_d30, execution_zone_d30,
+    /// options_chain_full, indices_ltpc, expansion_full) and
+    /// subscribe against each directly. See [`WsConnectionRole`] for
+    /// the canonical role → id mapping.
+    pub market_data_feed_v3_clients: MarketDataFeedV3ClientPool,
     pub rate_limiter: ApiRateLimiter,
 }
 
 impl ApiClient {
+    /// Construct an `ApiClient` with [`ClientCapabilities::default`]
+    /// — non-Plus, non-SEBI. Plus-only APIs return
+    /// [`RateLimitExceeded::FeatureRequiresPlus`]; the order-bucket
+    /// rate limiter caps per-second traffic at 10 req/s.
+    ///
+    /// Use [`ApiClient::new_with_capabilities`] to unlock Plus or
+    /// SEBI-registered behaviour. Chain [`ApiClient::set_algo_name`]
+    /// after construction when the `X-Algo-Name` header is required.
     pub async fn new(
         api_key: &str,
         login_config: LoginConfig,
@@ -402,18 +501,76 @@ impl ApiClient {
         schedule_refresh_instruments: bool,
         ws_connect_config: WSConnectConfig,
     ) -> Result<(Arc<Mutex<ApiClient>>, Vec<JoinHandle<()>>), String> {
+        Self::new_with_capabilities(
+            api_key,
+            login_config,
+            fetch_instruments,
+            schedule_refresh_instruments,
+            ws_connect_config,
+            ClientCapabilities::default(),
+        )
+        .await
+    }
+
+    /// Construct an `ApiClient` with a specific [`RateLimitProfile`].
+    ///
+    /// Kept as a thin compat wrapper — it leaves `is_plus_user = false`
+    /// so consumers that want Plus-only features must migrate to
+    /// [`ApiClient::new_with_capabilities`]. Scheduled for removal in
+    /// v3.
+    #[deprecated(
+        note = "Use `new_with_capabilities(ClientCapabilities)` — the profile-only \
+                constructor cannot express `is_plus_user` and leaves Plus-only \
+                APIs refusing with `RateLimitExceeded::FeatureRequiresPlus`."
+    )]
+    pub async fn new_with_profile(
+        api_key: &str,
+        login_config: LoginConfig,
+        fetch_instruments: bool,
+        schedule_refresh_instruments: bool,
+        ws_connect_config: WSConnectConfig,
+        rate_limit_profile: RateLimitProfile,
+    ) -> Result<(Arc<Mutex<ApiClient>>, Vec<JoinHandle<()>>), String> {
+        let capabilities = ClientCapabilities {
+            is_plus_user: false,
+            is_sebi_registered: matches!(rate_limit_profile, RateLimitProfile::SebiRegistered),
+        };
+        Self::new_with_capabilities(
+            api_key,
+            login_config,
+            fetch_instruments,
+            schedule_refresh_instruments,
+            ws_connect_config,
+            capabilities,
+        )
+        .await
+    }
+
+    /// Construct an `ApiClient` with an explicit
+    /// [`ClientCapabilities`] set. Preferred over
+    /// [`ApiClient::new`] whenever the account is on Upstox Plus
+    /// or has a SEBI-registered algo.
+    pub async fn new_with_capabilities(
+        api_key: &str,
+        login_config: LoginConfig,
+        fetch_instruments: bool,
+        schedule_refresh_instruments: bool,
+        ws_connect_config: WSConnectConfig,
+        capabilities: ClientCapabilities,
+    ) -> Result<(Arc<Mutex<ApiClient>>, Vec<JoinHandle<()>>), String> {
         let api_client = ApiClient {
             client: ReqwestClient::new(),
             api_key: api_key.to_string(),
             token: None,
+            algo_name: None,
+            capabilities,
             instruments: None,
             portfolio_feed_client: None,
-            market_data_feed_v3_client: None,
-            rate_limiter: ApiRateLimiter::new(
-                RATE_LIMIT_PER_SECOND,
-                RATE_LIMIT_PER_MINUTE,
-                RATE_LIMIT_PER_THIRTY_MINUTES,
-            ),
+            // `[const { None }; N]` is stable on Rust 2024; keeps the
+            // pool empty until `connect_market_data_feed_v3` populates
+            // individual slots.
+            market_data_feed_v3_clients: [const { None }; MAX_MARKET_DATA_CONNECTIONS],
+            rate_limiter: ApiRateLimiter::new(capabilities.rate_limit_profile()),
         };
 
         let shared_api_client = Arc::new(Mutex::new(api_client));
@@ -449,11 +606,35 @@ impl ApiClient {
                     .await?;
                 tasks_vec.push(portfolio_feed_task);
             }
-            if ws_connect_config.connect_market_data_stream_v3 {
-                let market_data_feed_v3_task = api_client
-                    .connect_market_data_feed_v3(ws_connect_config.market_data_feed_v3_callback)
+
+            // One WS per `WsChannelConfig` entry. The order is preserved
+            // so operators can see slot 0 -> 1 -> 2 -> 3 -> 4 handshakes
+            // in a deterministic sequence in the logs.
+            //
+            // Reject duplicate slot ids up front — two callbacks for
+            // the same pool id would lose the first callback silently
+            // (the second call would error with "slot already
+            // connected") or race depending on ordering.
+            let mut seen_slots: Vec<usize> =
+                Vec::with_capacity(ws_connect_config.market_data_streams.len());
+            for channel in ws_connect_config.market_data_streams {
+                if !channel.connection.is_valid() {
+                    return Err(format!(
+                        "WsChannelConfig slot {} out of range (max {MAX_MARKET_DATA_CONNECTIONS})",
+                        channel.connection.0
+                    ));
+                }
+                if seen_slots.contains(&channel.connection.0) {
+                    return Err(format!(
+                        "duplicate WsChannelConfig for slot {}",
+                        channel.connection.0
+                    ));
+                }
+                seen_slots.push(channel.connection.0);
+                let task = api_client
+                    .connect_market_data_feed_v3(channel.connection, channel.callback)
                     .await?;
-                tasks_vec.push(market_data_feed_v3_task);
+                tasks_vec.push(task);
             }
         }
 
@@ -592,12 +773,12 @@ impl ApiClient {
             );
         }
 
-        let mut request: RequestBuilder = match method {
+        let mut request: RequestBuilder = match method.clone() {
             Method::GET => self.client.get(url),
             Method::POST => self.client.post(url),
             Method::PUT => self.client.put(url),
             Method::DELETE => self.client.delete(url),
-            _ => panic!("Unsupported HTTP Method"),
+            other => return Err(RateLimitExceeded::UnsupportedMethod(other.to_string())),
         };
 
         if let Some(req_params) = params {
@@ -616,7 +797,65 @@ impl ApiClient {
             request = request.bearer_auth(&self.token.as_ref().unwrap());
         }
         request = request.header("Accept", "application/json");
-        Ok(request.send().await.unwrap())
+
+        // 2026-04-01 SEBI/Exchange circular: apps with registered algo
+        // strategies must stamp `X-Algo-Name` on every order-placement
+        // request. We scope the header to the order-placement bucket
+        // via `classify_endpoint` so standard reads (quotes/holidays/etc)
+        // don't carry a header Upstox does not accept there.
+        if let Some(ref name) = self.algo_name {
+            if matches!(
+                crate::rate_limiter::classify_endpoint(endpoint),
+                crate::rate_limiter::RateLimitBucket::OrderPlacement
+            ) {
+                request = request.header("X-Algo-Name", name.as_str());
+            }
+        }
+
+        // Transport errors (timeout, DNS, TLS, connection reset) used to
+        // abort the process via `.unwrap()`. Surface them as a
+        // `RateLimitExceeded::Network` variant so callers get a normal
+        // `Err` and can retry with their own backoff.
+        request
+            .send()
+            .await
+            .map_err(|e| RateLimitExceeded::Network(e.to_string()))
+    }
+
+    /// Set the `X-Algo-Name` header value sent on every order-placement
+    /// request. Pass `None` to clear. The header is never sent on
+    /// standard-bucket endpoints (quotes, candles, user, market info,
+    /// …). Required from 2026-04-01 for apps registered with an
+    /// exchange-approved algo strategy; optional otherwise.
+    pub fn set_algo_name(&mut self, algo_name: Option<String>) {
+        self.algo_name = algo_name;
+    }
+
+    /// Returns the currently-configured `X-Algo-Name` value (for audit /
+    /// logging). `None` when the header is not being sent.
+    pub fn algo_name(&self) -> Option<&str> {
+        self.algo_name.as_deref()
+    }
+
+    /// Immutable snapshot of the capability flags set at
+    /// [`ApiClient::new_with_capabilities`] time. Useful for feature
+    /// gates that want to present / hide UI before issuing a call.
+    pub fn capabilities(&self) -> ClientCapabilities {
+        self.capabilities
+    }
+
+    /// Refuse a Plus-only request up-front when the account does not
+    /// carry the entitlement. Keeps the per-call guard clause down to
+    /// a single `?` while producing a typed error the caller can match
+    /// on. `feature` is used verbatim in the error payload for
+    /// operator logging.
+    pub(crate) fn ensure_plus_user(&self, feature: &str) -> Result<(), RateLimitExceeded> {
+        if self.capabilities.is_plus_user {
+            return Ok(());
+        }
+        Err(RateLimitExceeded::FeatureRequiresPlus(format!(
+            "{feature} requires Upstox Plus (set ClientCapabilities::is_plus_user = true)"
+        )))
     }
 
     pub(crate) async fn verify_authorization(&mut self) -> bool {
@@ -700,11 +939,83 @@ pub enum MailProvider {
     Google,
 }
 
+/// Configuration for one market-data WebSocket channel inside
+/// [`WSConnectConfig::market_data_streams`].
+///
+/// Use [`ws_client::WsConnectionRole::id`][crate::ws_client::WsConnectionRole::id]
+/// for `connection` when the slot matches one of the five named
+/// roles; otherwise supply a raw [`WsConnectionId`] (`0..5`).
+pub struct WsChannelConfig {
+    /// Pool index to open (0..`MAX_MARKET_DATA_CONNECTIONS`).
+    pub connection: WsConnectionId,
+    /// Callback invoked for every decoded protobuf `FeedResponse`.
+    /// `None` is legal for operators who only need the raw feed on the
+    /// slot (debugging) but typical usage routes every tick.
+    pub callback: Option<MarketDataFeedV3CallbackBox>,
+}
+
 pub struct WSConnectConfig {
     pub connect_portfolio_stream: bool,
-    pub connect_market_data_stream_v3: bool,
     pub portfolio_stream_update_types: Option<HashSet<PortfolioUpdateType>>,
     pub portfolio_feed_callback: Option<Box<dyn FnMut(PortfolioFeedResponse) + Send + Sync>>,
-    pub market_data_feed_v3_callback:
-        Option<Box<dyn FnMut(MarketDataFeedV3Response) + Send + Sync>>,
+    /// Up to [`MAX_MARKET_DATA_CONNECTIONS`] market-data WS channels,
+    /// each on its own pool slot. An empty vec means "no market-data
+    /// WS connections at startup" — the client can still open slots
+    /// lazily via [`ApiClient::connect_market_data_feed_v3`] later.
+    pub market_data_streams: Vec<WsChannelConfig>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_capabilities_are_non_plus_non_sebi() {
+        let c = ClientCapabilities::default();
+        assert!(!c.is_plus_user);
+        assert!(!c.is_sebi_registered);
+        assert_eq!(c.rate_limit_profile(), RateLimitProfile::RegularAlgo);
+        assert_eq!(
+            c.max_market_data_connections(),
+            crate::ws_client::MAX_MARKET_DATA_CONNECTIONS_STANDARD,
+        );
+    }
+
+    #[test]
+    fn sebi_registered_flips_rate_limit_profile() {
+        let c = ClientCapabilities {
+            is_plus_user: false,
+            is_sebi_registered: true,
+        };
+        assert_eq!(c.rate_limit_profile(), RateLimitProfile::SebiRegistered);
+        // Plus flag is still false → standard WS cap.
+        assert_eq!(
+            c.max_market_data_connections(),
+            crate::ws_client::MAX_MARKET_DATA_CONNECTIONS_STANDARD,
+        );
+    }
+
+    #[test]
+    fn plus_user_flips_ws_connection_cap() {
+        let c = ClientCapabilities {
+            is_plus_user: true,
+            is_sebi_registered: false,
+        };
+        assert_eq!(c.max_market_data_connections(), MAX_MARKET_DATA_CONNECTIONS);
+        assert_eq!(c.rate_limit_profile(), RateLimitProfile::RegularAlgo);
+    }
+
+    #[test]
+    fn plus_sebi_short_hand_lights_every_flag() {
+        let c = ClientCapabilities::plus_sebi();
+        assert!(c.is_plus_user);
+        assert!(c.is_sebi_registered);
+    }
+
+    #[test]
+    fn standard_short_hand_leaves_every_flag_false() {
+        let c = ClientCapabilities::standard();
+        assert!(!c.is_plus_user);
+        assert!(!c.is_sebi_registered);
+    }
 }
