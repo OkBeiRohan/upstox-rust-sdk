@@ -58,7 +58,7 @@ pub struct GTTOrderRule {
     /// [`crate::models::orders::place_order_v3_request::PlaceOrderV3Request::market_protection`].
     /// Applied per-rule by Upstox (2026-03-11 announcement).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(validate_market_protection))]
+    #[validate(custom = validate_market_protection)]
     pub market_protection: Option<i32>,
 }
 

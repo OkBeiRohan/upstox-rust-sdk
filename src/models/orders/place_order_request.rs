@@ -31,6 +31,6 @@ pub struct PlaceOrderRequest {
     pub is_amo: bool,
     /// See [`super::place_order_v3_request::PlaceOrderV3Request::market_protection`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(validate_market_protection))]
+    #[validate(custom = validate_market_protection)]
     pub market_protection: Option<i32>,
 }

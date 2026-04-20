@@ -21,7 +21,7 @@ pub struct IntradayCandleDataV3Request {
         message = "Invalid instrument_key"
     )]
     pub instrument_key: String,
-    #[validate(custom(validate_unit))]
+    #[validate(custom = validate_unit)]
     pub unit: Unit,
     pub interval: String,
 }

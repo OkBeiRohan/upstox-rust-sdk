@@ -16,6 +16,6 @@ pub struct ExitAllPositionsRequest {
     /// Upstox applies MPP automatically on this endpoint; this field is
     /// exposed for operators who want to pin a specific percent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(validate_market_protection))]
+    #[validate(custom = validate_market_protection)]
     pub market_protection: Option<i32>,
 }

@@ -35,6 +35,6 @@ pub struct PlaceOrderV3Request {
     /// = custom percent). Added to the API on 2026-03-11; valid only for
     /// MARKET and SL-M order types — broker ignores on LIMIT / SL.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(validate_market_protection))]
+    #[validate(custom = validate_market_protection)]
     pub market_protection: Option<i32>,
 }
