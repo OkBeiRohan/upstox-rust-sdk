@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
@@ -204,11 +205,20 @@ impl RateLimiter {
 /// per-endpoint map is gone because Upstox limits are combined, not
 /// siloed. Safe to clone handles via `Arc` since the internal state
 /// lives behind `Mutex`.
+///
+/// The `disabled` flag is an **escape hatch for empirical probing**.
+/// When set, [`Self::check_rate_limit`] returns `None` immediately
+/// and [`Self::acquire_slot`] becomes a no-op — letting the caller
+/// send requests as fast as the network can carry them. Use ONLY
+/// for probing how Upstox's server-side limiter behaves under
+/// over-cap traffic; in production leave it off so we stay
+/// well-behaved per [Upstox's rate-limiting docs](https://upstox.com/developer/api-documentation/rate-limiting).
 #[derive(Debug)]
 pub struct ApiRateLimiter {
     order_bucket: Arc<RateLimiter>,
     standard_bucket: Arc<RateLimiter>,
     profile: RateLimitProfile,
+    disabled: AtomicBool,
 }
 
 impl ApiRateLimiter {
@@ -225,6 +235,7 @@ impl ApiRateLimiter {
                 STANDARD_BUCKET_PER_30_MINUTES,
             )),
             profile,
+            disabled: AtomicBool::new(false),
         }
     }
 
@@ -232,7 +243,39 @@ impl ApiRateLimiter {
         self.profile
     }
 
+    /// Disable / re-enable client-side pacing **at runtime**.
+    ///
+    /// When disabled, every call to `check_rate_limit` returns
+    /// `None` and every call to `acquire_slot` returns immediately
+    /// without recording the request. This lets an operator probe
+    /// Upstox's actual server-side limiter — i.e. fire bursts above
+    /// the documented 50/sec · 500/min · 2000/30min and observe
+    /// what HTTP status the server replies with.
+    ///
+    /// `Ordering::SeqCst` chosen for clarity rather than minimum
+    /// happens-before; the toggle is fired once at startup or by an
+    /// admin endpoint, never on the hot path, so the cost is
+    /// negligible.
+    ///
+    /// **Production callers should leave this `false`.** Bursting
+    /// past Upstox's documented caps risks 429s, account-wide
+    /// throttling, and potentially stricter limits if abuse is
+    /// detected.
+    pub fn set_disabled(&self, disabled: bool) {
+        self.disabled.store(disabled, Ordering::SeqCst);
+    }
+
+    /// Whether the limiter is currently in pass-through mode. See
+    /// [`Self::set_disabled`] for semantics.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::SeqCst)
+    }
+
     pub async fn check_rate_limit(&self, endpoint: &str) -> Option<RateLimitExceeded> {
+        if self.is_disabled() {
+            return None;
+        }
         let bucket = match classify_endpoint(endpoint) {
             RateLimitBucket::OrderPlacement => &self.order_bucket,
             RateLimitBucket::Standard => &self.standard_bucket,
@@ -416,5 +459,67 @@ mod tests {
         }
         // The standard bucket must NOT be affected.
         assert!(rl.check_rate_limit("/market-quote/ltp").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_bypasses_per_second_cap_for_standard_bucket() {
+        let rl = ApiRateLimiter::new(RateLimitProfile::SebiRegistered);
+        rl.set_disabled(true);
+        // 200 calls in a tight loop must all return None — the
+        // limiter is in pass-through mode, no slot accounting.
+        for _ in 0..200 {
+            assert!(rl.check_rate_limit("/market-quote/ltp").await.is_none());
+        }
+        assert!(rl.is_disabled());
+    }
+
+    #[tokio::test]
+    async fn disabled_bypasses_per_second_cap_for_order_bucket() {
+        // SEBI tier order cap is 50/s; disabling lets us push more.
+        let rl = ApiRateLimiter::new(RateLimitProfile::SebiRegistered);
+        rl.set_disabled(true);
+        for _ in 0..200 {
+            assert!(rl.check_rate_limit("/order/place").await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn re_enable_restores_normal_pacing() {
+        let rl = ApiRateLimiter::new(RateLimitProfile::SebiRegistered);
+        rl.set_disabled(true);
+        for _ in 0..200 {
+            assert!(rl.check_rate_limit("/market-quote/ltp").await.is_none());
+        }
+        // Re-enable. Note: the bucket still has 0 recorded requests
+        // because `set_disabled(true)` short-circuits before the
+        // VecDeque::push_back. So we should be able to do exactly
+        // STANDARD_BUCKET_PER_SECOND more before tripping.
+        rl.set_disabled(false);
+        assert!(!rl.is_disabled());
+        for _ in 0..STANDARD_BUCKET_PER_SECOND {
+            assert!(rl.check_rate_limit("/market-quote/ltp").await.is_none());
+        }
+        assert!(matches!(
+            rl.check_rate_limit("/market-quote/ltp").await,
+            Some(RateLimitExceeded::PerSecond { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_is_instant_when_disabled() {
+        let rl = ApiRateLimiter::new(RateLimitProfile::SebiRegistered);
+        rl.set_disabled(true);
+        let started = Instant::now();
+        // Even after artificially burning 100 calls (which would
+        // normally trip per-second), acquire_slot must return
+        // immediately because the disabled flag short-circuits.
+        for _ in 0..100 {
+            rl.acquire_slot("/market-quote/ltp").await;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "100 disabled acquire_slots should finish in <100ms; took {elapsed:?}",
+        );
     }
 }
