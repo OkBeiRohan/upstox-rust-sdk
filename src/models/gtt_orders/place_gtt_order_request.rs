@@ -1,7 +1,7 @@
 use {
     crate::models::{
-        gtt_orders::{validate_product_type, GTTOrderRule, GTTOrderType},
         ProductType, TransactionType,
+        gtt_orders::{GTTOrderRule, GTTOrderType, validate_product_type},
     },
     serde::Serialize,
     serde_valid::Validate,

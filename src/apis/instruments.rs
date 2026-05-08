@@ -4,14 +4,14 @@ use {
         constants::{
             INSTRUMENTS_ARCHIVE_FILENAME, INSTRUMENTS_COMPLETE_URL, INSTRUMENTS_JSON_FILENAME,
         },
-        models::{instruments::instruments_response::InstrumentsResponse, ExchangeSegment},
+        models::{ExchangeSegment, instruments::instruments_response::InstrumentsResponse},
     },
     flate2::read::GzDecoder,
     reqwest::{Client, Response},
     std::{
         collections::HashMap,
         fs::File,
-        io::{copy, Read},
+        io::{Read, copy},
     },
     tokio::fs,
     tracing::info,

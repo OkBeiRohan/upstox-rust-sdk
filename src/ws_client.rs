@@ -141,12 +141,10 @@ pub const ALL_WS_CONNECTION_ROLES: [WsConnectionRole; MAX_MARKET_DATA_CONNECTION
 /// Boxed callback signature used for all five market-data pools. Extracted
 /// as a type alias so `ApiClient` and `WSConnectConfig` can share a
 /// single stable signature.
-pub type MarketDataFeedV3CallbackBox =
-    Box<dyn FnMut(MarketDataFeedV3Response) + Send + Sync>;
+pub type MarketDataFeedV3CallbackBox = Box<dyn FnMut(MarketDataFeedV3Response) + Send + Sync>;
 
 /// Concrete `ezsockets` client type for one pool slot.
-pub type MarketDataFeedV3EzClient =
-    EzClient<MarketDataFeedV3Client<MarketDataFeedV3CallbackBox>>;
+pub type MarketDataFeedV3EzClient = EzClient<MarketDataFeedV3Client<MarketDataFeedV3CallbackBox>>;
 
 /// Array of 5 optional market-data WS clients — one per pool slot.
 pub type MarketDataFeedV3ClientPool =
@@ -362,9 +360,7 @@ impl ApiClient {
             )
             .into());
         }
-        if !self.capabilities.is_plus_user
-            && call_uses_full_d30(&market_data_feed_v3_message)
-        {
+        if !self.capabilities.is_plus_user && call_uses_full_d30(&market_data_feed_v3_message) {
             return Err(format!(
                 "ModeTypeV3::FullD30 subscribe on slot {} requires Upstox Plus \
                  (set ClientCapabilities::is_plus_user = true)",
@@ -485,7 +481,10 @@ mod tests {
             assert!(!seen[idx], "duplicate id for {role:?}");
             seen[idx] = true;
         }
-        assert!(seen.iter().all(|&v| v), "missing slot in role -> id mapping");
+        assert!(
+            seen.iter().all(|&v| v),
+            "missing slot in role -> id mapping"
+        );
     }
 
     #[test]
@@ -502,7 +501,10 @@ mod tests {
             WsConnectionRole::OptionsChainFull.default_mode(),
             ModeTypeV3::Full
         );
-        assert_eq!(WsConnectionRole::IndicesLtpc.default_mode(), ModeTypeV3::LTPC);
+        assert_eq!(
+            WsConnectionRole::IndicesLtpc.default_mode(),
+            ModeTypeV3::LTPC
+        );
         assert_eq!(
             WsConnectionRole::ExpansionFull.default_mode(),
             ModeTypeV3::Full
@@ -511,11 +513,26 @@ mod tests {
 
     #[test]
     fn ws_connection_role_default_max_instruments_match_upstox_plus() {
-        assert_eq!(WsConnectionRole::ConstituentsD30.default_max_instruments(), 50);
-        assert_eq!(WsConnectionRole::ExecutionZoneD30.default_max_instruments(), 50);
-        assert_eq!(WsConnectionRole::OptionsChainFull.default_max_instruments(), 2000);
-        assert_eq!(WsConnectionRole::IndicesLtpc.default_max_instruments(), 5000);
-        assert_eq!(WsConnectionRole::ExpansionFull.default_max_instruments(), 2000);
+        assert_eq!(
+            WsConnectionRole::ConstituentsD30.default_max_instruments(),
+            50
+        );
+        assert_eq!(
+            WsConnectionRole::ExecutionZoneD30.default_max_instruments(),
+            50
+        );
+        assert_eq!(
+            WsConnectionRole::OptionsChainFull.default_max_instruments(),
+            2000
+        );
+        assert_eq!(
+            WsConnectionRole::IndicesLtpc.default_max_instruments(),
+            5000
+        );
+        assert_eq!(
+            WsConnectionRole::ExpansionFull.default_max_instruments(),
+            2000
+        );
     }
 
     #[test]
@@ -544,9 +561,9 @@ mod tests {
         assert!(call_uses_full_d30(&MarketDataV3Call::ChangeMode(
             data_d30.clone()
         )));
-        assert!(call_uses_full_d30(&MarketDataV3Call::UnsubscribeInstrument(
-            data_d30
-        )));
+        assert!(call_uses_full_d30(
+            &MarketDataV3Call::UnsubscribeInstrument(data_d30)
+        ));
 
         let data_full = MessageDataV3 {
             mode: ModeTypeV3::Full,

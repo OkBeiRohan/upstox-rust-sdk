@@ -1,5 +1,5 @@
 use {
-    crate::models::{orders::OrderType, ProductType, TransactionType},
+    crate::models::{ProductType, TransactionType, orders::OrderType},
     serde::{Deserialize, Serialize},
 };
 

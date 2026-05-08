@@ -1,5 +1,5 @@
 use {
-    crate::models::{market_information::market_timings_response::MarketTimingResponse, Exchange},
+    crate::models::{Exchange, market_information::market_timings_response::MarketTimingResponse},
     serde::{Deserialize, Serialize},
 };
 

@@ -1,7 +1,8 @@
 use {
     crate::models::{
+        ProductType, TransactionType,
         orders::{OrderType, ValidityType},
-        validate_market_protection, ProductType, TransactionType,
+        validate_market_protection,
     },
     serde::Serialize,
     serde_valid::Validate,

@@ -119,9 +119,11 @@ pub const STANDARD_BUCKET_PER_MINUTE: usize = 500;
 /// Standard read/account bucket — per-30-minute cap.
 pub const STANDARD_BUCKET_PER_30_MINUTES: usize = 2000;
 
-#[deprecated(note = "Use the bucket-specific constants (ORDER_BUCKET_* / STANDARD_BUCKET_*). The \
+#[deprecated(
+    note = "Use the bucket-specific constants (ORDER_BUCKET_* / STANDARD_BUCKET_*). The \
                      pre-v2 SDK modelled limits per-endpoint with a flat (25, 250, 1000) bucket \
-                     which does not match Upstox's combined-bucket reality.")]
+                     which does not match Upstox's combined-bucket reality."
+)]
 #[allow(dead_code)]
 pub(super) const RATE_LIMIT_PER_SECOND: usize = 25;
 #[deprecated(note = "Use the bucket-specific constants (ORDER_BUCKET_* / STANDARD_BUCKET_*).")]

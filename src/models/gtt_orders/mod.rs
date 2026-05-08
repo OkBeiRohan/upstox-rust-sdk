@@ -6,7 +6,7 @@ pub mod modify_gtt_order_request;
 pub mod place_gtt_order_request;
 
 use {
-    crate::models::{validate_market_protection, ProductType, TransactionType},
+    crate::models::{ProductType, TransactionType, validate_market_protection},
     serde::{Deserialize, Serialize},
     serde_valid::{Validate, validation::Error},
 };

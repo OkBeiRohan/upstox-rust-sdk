@@ -1,5 +1,5 @@
 use {
-    crate::models::{trade_profit_and_loss::segment_validation, SegmentType},
+    crate::models::{SegmentType, trade_profit_and_loss::segment_validation},
     serde::Serialize,
     serde_valid::Validate,
 };

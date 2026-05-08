@@ -1,7 +1,7 @@
 use {
     crate::models::{ProductType, TransactionType},
     serde::Serialize,
-    serde_valid::{validation, Validate},
+    serde_valid::{Validate, validation},
 };
 
 #[derive(Serialize, Debug, Validate)]

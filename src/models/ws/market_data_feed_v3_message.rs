@@ -61,8 +61,7 @@ mod tests {
         ] {
             let ser = serde_json::to_string(&mode).expect("ModeTypeV3 serializes");
             assert_eq!(ser, expected, "wire name drift for {mode:?}");
-            let de: ModeTypeV3 =
-                serde_json::from_str(expected).expect("ModeTypeV3 deserializes");
+            let de: ModeTypeV3 = serde_json::from_str(expected).expect("ModeTypeV3 deserializes");
             assert_eq!(de, mode, "round-trip drift for {mode:?}");
         }
     }

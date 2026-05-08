@@ -1,7 +1,7 @@
 use {
     crate::models::{
-        orders::{OrderType, ValidityType},
         OrderStatus, OrderVariety, ProductType, TransactionType,
+        orders::{OrderType, ValidityType},
     },
     serde::{Deserialize, Serialize},
 };

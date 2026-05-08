@@ -1,4 +1,7 @@
-use {crate::models::Exchange, serde::{Deserialize, Serialize}};
+use {
+    crate::models::Exchange,
+    serde::{Deserialize, Serialize},
+};
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
