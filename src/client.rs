@@ -360,8 +360,8 @@ use {
         rate_limiter::{ApiRateLimiter, RateLimitExceeded, RateLimitProfile},
         utils::create_url,
         ws_client::{
-            MarketDataFeedV3CallbackBox, MarketDataFeedV3ClientPool, PortfolioFeedClient,
-            WsConnectionId, MAX_MARKET_DATA_CONNECTIONS,
+            MAX_MARKET_DATA_CONNECTIONS, MarketDataFeedV3CallbackBox, MarketDataFeedV3ClientPool,
+            PortfolioFeedClient, WsConnectionId,
         },
     },
     chrono::FixedOffset,
@@ -756,11 +756,17 @@ impl ApiClient {
     where
         T: Serialize + ?Sized,
     {
-        let rate_limit_check_result: Option<RateLimitExceeded> =
-            self.rate_limiter.check_rate_limit(endpoint).await;
-        if rate_limit_check_result.is_some() {
-            return Err(rate_limit_check_result.unwrap());
-        }
+        // Self-pacing: block until a slot is free in the appropriate
+        // bucket. Pre-v3 SDK released here with a non-blocking
+        // `check_rate_limit` that surfaced `RateLimitExceeded::Per*`
+        // up to the caller, forcing every consumer to wrap each call
+        // in a retry-with-sleep loop. v3 (this file) flips to
+        // self-pacing — `acquire_slot` polls the bucket + sleeps
+        // until a slot is available, so consumers only see
+        // `RateLimitExceeded` if Upstox's account-wide cap (which
+        // can be exhausted by a prior process) trips at the
+        // network layer.
+        self.rate_limiter.acquire_slot(endpoint).await;
         let url: String = create_url(base_url_type, api_version, endpoint);
 
         if authorized && !self.token.is_some() {

@@ -46,9 +46,15 @@ use crate::constants::{
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RateLimitExceeded {
-    PerSecond { next_allowed_at: Instant },
-    PerMinute { next_allowed_at: Instant },
-    PerThirtyMinutes { next_allowed_at: Instant },
+    PerSecond {
+        next_allowed_at: Instant,
+    },
+    PerMinute {
+        next_allowed_at: Instant,
+    },
+    PerThirtyMinutes {
+        next_allowed_at: Instant,
+    },
     /// Transport-level failure forwarding the request — reqwest error,
     /// DNS miss, TLS handshake abort, or socket-level timeout. The
     /// inner string is the reqwest error's `Display` for operator
@@ -233,6 +239,43 @@ impl ApiRateLimiter {
         };
         bucket.check_rate_limit().await
     }
+
+    /// Block until a slot is available in the appropriate bucket, then
+    /// record the request. Polls [`Self::check_rate_limit`] in a sleep
+    /// loop, sleeping until the bucket reports a slot is free
+    /// (`next_allowed_at`) plus a small (10 ms) jitter to avoid
+    /// thundering-herd waking when many tasks contend on the same
+    /// bucket.
+    ///
+    /// This is the **self-pacing** entry-point. Use it from inside the
+    /// SDK's HTTP wrappers so callers don't have to wrap every request
+    /// in their own retry-on-`RateLimitExceeded` loop. The SDK's
+    /// per-process bucket sizes still have to match Upstox's
+    /// account-wide cap (both 50/sec · 500/min · 2000/30min for the
+    /// Standard bucket), so a fresh process that has already burned the
+    /// account's per-30-min quota in a previous run will still get
+    /// HTTP 429s from Upstox itself; those are surfaced unchanged.
+    pub async fn acquire_slot(&self, endpoint: &str) {
+        const JITTER: Duration = Duration::from_millis(10);
+        loop {
+            match self.check_rate_limit(endpoint).await {
+                None => return,
+                Some(RateLimitExceeded::PerSecond { next_allowed_at })
+                | Some(RateLimitExceeded::PerMinute { next_allowed_at })
+                | Some(RateLimitExceeded::PerThirtyMinutes { next_allowed_at }) => {
+                    let now = Instant::now();
+                    let wait = next_allowed_at.saturating_duration_since(now) + JITTER;
+                    tokio::time::sleep(wait).await;
+                }
+                // Network / UnsupportedMethod / FeatureRequiresPlus
+                // are not bucket conditions — but `check_rate_limit`
+                // never produces them. The match is exhaustive only
+                // for the rate-limit variants; bail out so we don't
+                // spin if the SDK ever expands the enum.
+                _ => return,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -295,7 +338,10 @@ mod tests {
             assert!(rl.check_rate_limit("/order/place").await.is_none());
         }
         let exceeded = rl.check_rate_limit("/order/place").await;
-        assert!(matches!(exceeded, Some(RateLimitExceeded::PerSecond { .. })));
+        assert!(matches!(
+            exceeded,
+            Some(RateLimitExceeded::PerSecond { .. })
+        ));
     }
 
     #[tokio::test]
@@ -326,6 +372,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acquire_slot_returns_immediately_when_under_cap() {
+        let rl = ApiRateLimiter::new(RateLimitProfile::SebiRegistered);
+        let started = Instant::now();
+        rl.acquire_slot("/market-quote/ltp").await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "acquire_slot should not sleep when a slot is free; took {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_blocks_then_returns_when_per_second_exhausted() {
+        let rl = ApiRateLimiter::new(RateLimitProfile::SebiRegistered);
+        // Burn the per-second cap on the standard bucket (50/s).
+        for _ in 0..STANDARD_BUCKET_PER_SECOND {
+            rl.acquire_slot("/market-quote/ltp").await;
+        }
+        // The 51st call must SLEEP at least until the per-second
+        // window slides — but it must NOT panic, error, or return
+        // early. We expect ≥ ~990ms wait (1 second minus the time
+        // already elapsed since the first request).
+        let started = Instant::now();
+        rl.acquire_slot("/market-quote/ltp").await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "acquire_slot should sleep ~1s on per-second exhaustion; took {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "acquire_slot waited too long; took {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn standard_and_order_buckets_are_independent() {
         let rl = ApiRateLimiter::new(RateLimitProfile::RegularAlgo);
         // Exhaust the order bucket.
@@ -333,9 +415,6 @@ mod tests {
             assert!(rl.check_rate_limit("/order/place").await.is_none());
         }
         // The standard bucket must NOT be affected.
-        assert!(rl
-            .check_rate_limit("/market-quote/ltp")
-            .await
-            .is_none());
+        assert!(rl.check_rate_limit("/market-quote/ltp").await.is_none());
     }
 }
