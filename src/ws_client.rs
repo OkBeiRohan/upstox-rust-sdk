@@ -21,12 +21,21 @@ use {
         rate_limiter::RateLimitExceeded,
     },
     async_trait::async_trait,
-    ezsockets::{Bytes, Client as EzClient, ClientConfig, ClientExt, Error as EzError, Utf8Bytes},
+    ezsockets::{
+        Bytes, Client as EzClient, ClientConfig, ClientExt, Error as EzError, Utf8Bytes,
+        client::ClientCloseMode,
+    },
     protobuf::Message,
     reqwest::Url,
     serde::{Deserialize, Serialize},
     serde_json,
-    std::collections::{HashSet, hash_set},
+    std::{
+        collections::{HashSet, hash_set},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    },
     tokio::task::JoinHandle,
 };
 
@@ -146,9 +155,38 @@ pub type MarketDataFeedV3CallbackBox = Box<dyn FnMut(MarketDataFeedV3Response) +
 /// Concrete `ezsockets` client type for one pool slot.
 pub type MarketDataFeedV3EzClient = EzClient<MarketDataFeedV3Client<MarketDataFeedV3CallbackBox>>;
 
+/// Slot pool entry — pairs the ezsockets handle with a shared
+/// `is_open` flag that the slot's `ClientExt` flips in
+/// `on_connect` / `on_disconnect`. Without this pair, callers
+/// that ask "is the WS open?" only learn whether the handle was
+/// stored (i.e. `ezsockets::connect` returned), NOT whether the
+/// TLS + WS-upgrade handshake has completed. The race that fix
+/// resolves: NOB's `subscribe_plan` fires the moment all 5 slots'
+/// connect calls return, and used to dispatch `Sub` frames into
+/// not-yet-open sockets — ezsockets dropped them silently and
+/// the broker reported a successful subscribe with zero ticks
+/// arriving on the affected slot until the next reconnect.
+///
+/// `Debug` is intentionally NOT derived: the inner ezsockets
+/// `Client` carries a `dyn FnMut(...)` callback that does not
+/// implement `Debug`, and the field is opaque to callers anyway.
+pub struct MarketDataFeedV3PoolEntry {
+    pub handle: MarketDataFeedV3EzClient,
+    pub is_open: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for MarketDataFeedV3PoolEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarketDataFeedV3PoolEntry")
+            .field("handle", &"<EzClient>")
+            .field("is_open", &self.is_open.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
 /// Array of 5 optional market-data WS clients — one per pool slot.
 pub type MarketDataFeedV3ClientPool =
-    [Option<MarketDataFeedV3EzClient>; MAX_MARKET_DATA_CONNECTIONS];
+    [Option<MarketDataFeedV3PoolEntry>; MAX_MARKET_DATA_CONNECTIONS];
 
 #[derive(Debug)]
 pub struct PortfolioFeedClient<F>
@@ -166,6 +204,10 @@ where
 {
     pub handle: EzClient<Self>,
     callback: Option<F>,
+    /// Shared with `MarketDataFeedV3PoolEntry::is_open` so callers
+    /// can poll true WS-open state. ezsockets drives this via
+    /// `on_connect` (set true) and `on_disconnect` (set false).
+    is_open: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -176,9 +218,19 @@ where
     type Call = ();
 
     async fn on_text(&mut self, text: Utf8Bytes) -> Result<(), EzError> {
+        // Resilience: a malformed portfolio JSON frame (or a new
+        // SDK-untaught variant) must NOT force-close the portfolio
+        // WS. Log + drop and keep the stream alive for the next
+        // order / position update.
         if let Some(callback) = &mut self.callback {
-            let data: PortfolioFeedResponse = serde_json::from_str::<PortfolioFeedResponse>(&text)?;
-            callback(data);
+            match serde_json::from_str::<PortfolioFeedResponse>(&text) {
+                Ok(data) => callback(data),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    bytes = text.len(),
+                    "portfolio-feed JSON parse failed; dropping frame (WS stays open)"
+                ),
+            }
         }
         Ok(())
     }
@@ -199,15 +251,48 @@ where
 {
     type Call = MarketDataV3Call;
 
+    /// Flip the shared open-flag on TLS+WS upgrade success.
+    /// `is_market_data_connected` reads this so callers waiting on
+    /// the slot can distinguish "handle stored" from "socket actually
+    /// open and able to ship `Sub` frames".
+    async fn on_connect(&mut self) -> Result<(), EzError> {
+        self.is_open.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Mirror of `on_connect` — the open-flag flips back to false on
+    /// any disconnect (transient, broker-initiated, or fatal). The
+    /// supervisor `ClientCloseMode::Reconnect` keeps ezsockets's
+    /// auto-reconnect behaviour intact; the next successful
+    /// `on_connect` re-arms the flag.
+    async fn on_disconnect(&mut self) -> Result<ClientCloseMode, EzError> {
+        self.is_open.store(false, Ordering::Release);
+        Ok(ClientCloseMode::Reconnect)
+    }
+
     async fn on_text(&mut self, _: Utf8Bytes) -> Result<(), EzError> {
         Ok(())
     }
 
     async fn on_binary(&mut self, binary_data: Bytes) -> Result<(), EzError> {
+        // CRITICAL: per ezsockets `ClientExt` semantics, returning
+        // `Err` here force-closes the WS. A single malformed or
+        // newly-typed protobuf frame from Upstox (which we have
+        // observed in production whenever the broker rolls a feature
+        // flag) would therefore kill the slot for the rest of the
+        // session — and our pool entry would stay alive until the
+        // 90 s stall watchdog noticed. Swallow the parse error
+        // instead: log + drop the offending frame, keep the WS up
+        // for the next batch.
         if let Some(callback) = &mut self.callback {
-            let data: MarketDataFeedV3Response =
-                MarketDataFeedV3Response::parse_from_bytes(&binary_data)?;
-            callback(data);
+            match MarketDataFeedV3Response::parse_from_bytes(&binary_data) {
+                Ok(data) => callback(data),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    bytes = binary_data.len(),
+                    "market-data protobuf parse failed; dropping batch (WS stays open)"
+                ),
+            }
         }
         Ok(())
     }
@@ -229,7 +314,19 @@ where
 
         let message_text: String = serde_json::to_string(&market_data_feed_message).unwrap();
         let message_binary: Vec<u8> = message_text.into_bytes();
-        self.handle.binary(message_binary)?;
+        // Same rationale as `on_binary`: if the underlying socket
+        // is mid-reconnect, `handle.binary(...)` returns `Err` and
+        // returning it here would force-close the WS — exactly the
+        // wrong response when the actor is already trying to
+        // recover. Log + drop instead so the next subscribe arrives
+        // on the freshly-reconnected socket.
+        if let Err(e) = self.handle.binary(message_binary) {
+            tracing::warn!(
+                error = %e,
+                "market-data WS binary send failed (likely mid-reconnect); \
+                 dropping subscribe frame, caller should re-issue after reconnect"
+            );
+        }
         Ok(())
     }
 }
@@ -254,8 +351,23 @@ impl ApiClient {
             ezsockets::connect(|handle| PortfolioFeedClient { handle, callback }, config).await;
         self.portfolio_feed_client = Some(handle);
 
+        // Drive the actor-loop future without `unwrap()`: a panic
+        // here would tear down the spawned task with no operator
+        // signal. Log the exit instead so a portfolio-feed death
+        // (which silently stops fill / position updates from
+        // reaching the executor) surfaces in the logs.
         let feed_future: JoinHandle<()> = tokio::spawn(async move {
-            future.await.unwrap();
+            match future.await {
+                Ok(()) => tracing::warn!(
+                    "portfolio-feed WS actor exited cleanly \
+                     (no further fills / positions will reach the executor)"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "portfolio-feed WS actor exited with error \
+                     (no further fills / positions will reach the executor)"
+                ),
+            }
         });
         Ok(feed_future)
     }
@@ -310,14 +422,107 @@ impl ApiClient {
             .authorized_redirect_uri;
 
         let config: ClientConfig = ClientConfig::new(Url::parse(&authorized_url).unwrap());
-        let (handle, future) =
-            ezsockets::connect(|handle| MarketDataFeedV3Client { handle, callback }, config).await;
-        self.market_data_feed_v3_clients[conn.0] = Some(handle);
+        // Share an `is_open` flag between the slot's `ClientExt` and
+        // the pool entry. The flag stays `false` until ezsockets
+        // dispatches `on_connect` (TLS + WS upgrade complete) and
+        // flips back to `false` on every `on_disconnect`. Callers MUST
+        // poll this through `is_market_data_connected` before
+        // dispatching subscribes — bare handle existence is not enough.
+        let is_open = Arc::new(AtomicBool::new(false));
+        let is_open_for_client = Arc::clone(&is_open);
+        let (handle, future) = ezsockets::connect(
+            move |handle| MarketDataFeedV3Client {
+                handle,
+                callback,
+                is_open: is_open_for_client,
+            },
+            config,
+        )
+        .await;
+        self.market_data_feed_v3_clients[conn.0] = Some(MarketDataFeedV3PoolEntry {
+            handle,
+            is_open: Arc::clone(&is_open),
+        });
 
+        // Drive the actor-loop future to completion in a dedicated
+        // task. CRITICAL: do NOT `unwrap()` the result here — the
+        // future returns `Err(...)` on persistent connect failure,
+        // unrecoverable handshake error, or operator-initiated close,
+        // and a panic in the spawned task would leave the slot's
+        // pool entry ALIVE (`is_open == true`) while the underlying
+        // ezsockets actor is dead, invisible to every consumer of
+        // [`Self::is_market_data_connected`].
+        //
+        // Instead: on ANY exit (clean or error), flip `is_open` to
+        // false so the watchdog observes the slot as disconnected
+        // and can dispatch a reconnect via
+        // [`Self::reconnect_market_data_by_id`]. The error is
+        // logged with the slot id so operators see *which* slot
+        // died.
+        let conn_id_for_log = conn.0;
         let feed_future: JoinHandle<()> = tokio::spawn(async move {
-            future.await.unwrap();
+            match future.await {
+                Ok(()) => tracing::warn!(
+                    slot = conn_id_for_log,
+                    "market-data WS actor exited cleanly (slot now silent until reconnect)"
+                ),
+                Err(e) => tracing::error!(
+                    slot = conn_id_for_log,
+                    error = %e,
+                    "market-data WS actor exited with error (slot now silent until reconnect)"
+                ),
+            }
+            // Flip BEFORE the task returns so the watchdog's next
+            // `is_market_data_connected` poll observes the dead state.
+            is_open.store(false, Ordering::Release);
         });
         Ok(feed_future)
+    }
+
+    /// Tear down a dead market-data slot's pool entry and re-spawn a
+    /// fresh WebSocket on the same role with the supplied callback.
+    ///
+    /// Rationale: when [`Self::connect_market_data_feed_v3`]'s
+    /// underlying actor task exits (the handler returned `Err`,
+    /// ezsockets exhausted reconnect attempts, etc.), the pool
+    /// entry stays around with `is_open == false` so consumers can
+    /// detect the death — but the dead handle is unusable. This
+    /// helper drops the dead entry and runs the connect path again.
+    ///
+    /// Returns the new actor-loop `JoinHandle`. Callers should hold
+    /// it for the lifetime of the slot or `tokio::spawn` a
+    /// supervisor; on the SDK boot path that's
+    /// [`ApiClient::new_with_capabilities`] which keeps every
+    /// returned handle inside its `tasks_vec`.
+    pub async fn reconnect_market_data_by_id(
+        &mut self,
+        conn: WsConnectionId,
+        callback: Option<MarketDataFeedV3CallbackBox>,
+    ) -> Result<JoinHandle<()>, String> {
+        if !conn.is_valid() {
+            return Err(format!(
+                "WsConnectionId {} is out of range (max {MAX_MARKET_DATA_CONNECTIONS})",
+                conn.0
+            ));
+        }
+        // Drop the dead pool entry first so `connect_market_data_feed_v3`'s
+        // "already connected" guard does not refuse the fresh open.
+        // Any clones of the previous handle held by callers will
+        // continue to send into the dead async-channel until they
+        // are dropped — that's harmless because the actor loop is
+        // gone and the channel is unbounded; messages just queue
+        // and never get processed.
+        self.market_data_feed_v3_clients[conn.0] = None;
+        self.connect_market_data_feed_v3(conn, callback).await
+    }
+
+    /// Convenience wrapper: reconnect by [`WsConnectionRole`].
+    pub async fn reconnect_market_data_by_role(
+        &mut self,
+        role: WsConnectionRole,
+        callback: Option<MarketDataFeedV3CallbackBox>,
+    ) -> Result<JoinHandle<()>, String> {
+        self.reconnect_market_data_by_id(role.id(), callback).await
     }
 
     /// Convenience wrapper — open the physical slot this role maps to
@@ -330,8 +535,29 @@ impl ApiClient {
         self.connect_market_data_feed_v3(role.id(), callback).await
     }
 
-    /// `true` when the given pool slot currently holds an active WS client.
+    /// `true` when the given pool slot's WebSocket has finished the
+    /// TLS + WS-upgrade handshake and is ready to ship `Sub` /
+    /// `ChangeMode` / `Unsub` frames.
+    ///
+    /// Reads the shared `is_open` flag the slot's `ClientExt` flips
+    /// in `on_connect` / `on_disconnect`. This is intentionally
+    /// stricter than "is the handle stored?" — a handle that exists
+    /// but whose underlying socket is mid-handshake will silently
+    /// drop subscribe traffic (per ezsockets semantics), so callers
+    /// must wait for this to return `true` before issuing the first
+    /// `Sub` frame on any new slot.
     pub fn is_market_data_connected(&self, conn: WsConnectionId) -> bool {
+        conn.is_valid()
+            && self.market_data_feed_v3_clients[conn.0]
+                .as_ref()
+                .is_some_and(|entry| entry.is_open.load(Ordering::Acquire))
+    }
+
+    /// `true` when the given pool slot has a stored handle, regardless
+    /// of WS-open status. Useful for "should I attempt a connect?"
+    /// checks where the answer is "no, it's already in flight".
+    /// Most callers want [`Self::is_market_data_connected`] instead.
+    pub fn has_market_data_handle(&self, conn: WsConnectionId) -> bool {
         conn.is_valid() && self.market_data_feed_v3_clients[conn.0].is_some()
     }
 
@@ -368,10 +594,32 @@ impl ApiClient {
             )
             .into());
         }
-        if let Some(client) = &self.market_data_feed_v3_clients[conn.0] {
-            client.call(market_data_feed_v3_message)?;
+        // Refuse to dispatch into a slot whose WS upgrade has not
+        // completed yet. ezsockets's `client.call()` would buffer or
+        // silently drop the frame depending on its internal state,
+        // and the broker would acknowledge a subscribe that never
+        // actually arrived. Returning a typed error here gives the
+        // caller a clear failure signal it can retry on instead of
+        // declaring success for a phantom subscribe.
+        match self.market_data_feed_v3_clients[conn.0].as_ref() {
+            Some(entry) if entry.is_open.load(Ordering::Acquire) => {
+                entry.handle.call(market_data_feed_v3_message)?;
+                Ok(())
+            }
+            Some(_) => Err(format!(
+                "market-data WS slot {} handle exists but socket is not open yet \
+                 (TLS / WS upgrade still in flight) — caller must wait for \
+                 `is_market_data_connected` before dispatching",
+                conn.0
+            )
+            .into()),
+            None => Err(format!(
+                "market-data WS slot {} is not connected — call \
+                 `connect_market_data_feed_v3` first",
+                conn.0
+            )
+            .into()),
         }
-        Ok(())
     }
 
     /// Convenience wrapper — send on the slot this role maps to.

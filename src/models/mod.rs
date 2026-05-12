@@ -59,18 +59,63 @@ pub struct ResponseSummary {
     pub error: u32,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(rename_all = "UPPERCASE")]
+/// An Upstox asset-type tag.
+///
+/// Permissive by design — the public instruments archive carries an
+/// empty `asset_type: ""` for `GLOBAL_INDEX` rows and Upstox has
+/// historically introduced new tags (e.g. `IRD`) without notice.
+/// Unknown values land in [`AssetType::Other`] so the raw string is
+/// preserved for diagnostic logging and the SDK continues to parse
+/// the rest of the archive instead of failing the whole boot.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(from = "String", into = "String")]
 pub enum AssetType {
     COM,
     INDEX,
     EQUITY,
     CUR,
     IRD,
+    /// Any asset-type tag not known to this SDK build, including the
+    /// empty string Upstox emits for `GLOBAL_INDEX` rows.
+    Other(String),
 }
 
+impl From<String> for AssetType {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "COM" => AssetType::COM,
+            "INDEX" => AssetType::INDEX,
+            "EQUITY" => AssetType::EQUITY,
+            "CUR" => AssetType::CUR,
+            "IRD" => AssetType::IRD,
+            _ => AssetType::Other(s),
+        }
+    }
+}
+
+impl From<AssetType> for String {
+    fn from(a: AssetType) -> String {
+        match a {
+            AssetType::COM => "COM".to_string(),
+            AssetType::INDEX => "INDEX".to_string(),
+            AssetType::EQUITY => "EQUITY".to_string(),
+            AssetType::CUR => "CUR".to_string(),
+            AssetType::IRD => "IRD".to_string(),
+            AssetType::Other(s) => s,
+        }
+    }
+}
+
+/// An Upstox exchange-segment tag.
+///
+/// Permissive by design — Upstox added `GLOBAL_INDEX` (Hang Seng,
+/// S&P 500, Nasdaq, FTSE, …) to the public instruments archive in
+/// May 2026 and will keep adding more. Unknown values land in
+/// [`ExchangeSegment::Other`] so the SDK can deserialize the whole
+/// archive and downstream code that filters by `NseEq` / `NseFo`
+/// etc. naturally ignores segments it does not subscribe to.
 #[derive(Deserialize, Serialize, Debug, Eq, Hash, Clone, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(from = "String", into = "String")]
 pub enum ExchangeSegment {
     NseEq,
     NseIndex,
@@ -82,6 +127,45 @@ pub enum ExchangeSegment {
     BseFo,
     BcdFo,
     McxFo,
+    /// Any segment tag not known to this SDK build (e.g.
+    /// `GLOBAL_INDEX`, future MCX index variants).
+    Other(String),
+}
+
+impl From<String> for ExchangeSegment {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "NSE_EQ" => ExchangeSegment::NseEq,
+            "NSE_INDEX" => ExchangeSegment::NseIndex,
+            "NSE_FO" => ExchangeSegment::NseFo,
+            "NSE_COM" => ExchangeSegment::NseCom,
+            "NCD_FO" => ExchangeSegment::NcdFo,
+            "BSE_EQ" => ExchangeSegment::BseEq,
+            "BSE_INDEX" => ExchangeSegment::BseIndex,
+            "BSE_FO" => ExchangeSegment::BseFo,
+            "BCD_FO" => ExchangeSegment::BcdFo,
+            "MCX_FO" => ExchangeSegment::McxFo,
+            _ => ExchangeSegment::Other(s),
+        }
+    }
+}
+
+impl From<ExchangeSegment> for String {
+    fn from(s: ExchangeSegment) -> String {
+        match s {
+            ExchangeSegment::NseEq => "NSE_EQ".to_string(),
+            ExchangeSegment::NseIndex => "NSE_INDEX".to_string(),
+            ExchangeSegment::NseFo => "NSE_FO".to_string(),
+            ExchangeSegment::NseCom => "NSE_COM".to_string(),
+            ExchangeSegment::NcdFo => "NCD_FO".to_string(),
+            ExchangeSegment::BseEq => "BSE_EQ".to_string(),
+            ExchangeSegment::BseIndex => "BSE_INDEX".to_string(),
+            ExchangeSegment::BseFo => "BSE_FO".to_string(),
+            ExchangeSegment::BcdFo => "BCD_FO".to_string(),
+            ExchangeSegment::McxFo => "MCX_FO".to_string(),
+            ExchangeSegment::Other(s) => s,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
