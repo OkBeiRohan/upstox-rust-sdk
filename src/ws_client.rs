@@ -22,8 +22,8 @@ use {
     },
     async_trait::async_trait,
     ezsockets::{
-        Bytes, Client as EzClient, ClientConfig, ClientExt, Error as EzError, Utf8Bytes,
-        client::ClientCloseMode,
+        Bytes, Client as EzClient, ClientConfig, ClientExt, Error as EzError, SocketConfig,
+        Utf8Bytes, client::ClientCloseMode,
     },
     protobuf::Message,
     reqwest::Url,
@@ -35,6 +35,7 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        time::Duration,
     },
     tokio::task::JoinHandle,
 };
@@ -421,7 +422,39 @@ impl ApiClient {
             .data
             .authorized_redirect_uri;
 
-        let config: ClientConfig = ClientConfig::new(Url::parse(&authorized_url).unwrap());
+        // Build the ezsockets client config. Two non-default knobs:
+        //
+        // 1. `max_initial_connect_attempts(1)` — Upstox's
+        //    `/feed/market-data-feed/authorize` endpoint returns a
+        //    SINGLE-USE auth URL with a one-shot `code` parameter.
+        //    The default ezsockets behaviour (`usize::MAX` retries
+        //    with `DEFAULT_RECONNECT_INTERVAL = 5s`) burns that URL
+        //    on retry #1 and then loops forever on a code the broker
+        //    has already invalidated, leaving the slot dead with no
+        //    way to recover from inside the actor task. Capping at
+        //    one attempt makes the actor exit cleanly on a failed
+        //    handshake; the supervised cleanup wrapper flips
+        //    `is_open` back to false and the calling watchdog
+        //    (`reconnect_market_data_by_id`) drops the dead pool
+        //    entry and re-runs `connect_market_data_feed_v3` —
+        //    which fetches a FRESH auth URL with a fresh code.
+        //
+        // 2. `socket_config({ heartbeat: 15s, timeout: 30s })` —
+        //    the ezsockets defaults (5 s heartbeat / 10 s timeout)
+        //    were observed in the 2026-05-12 NOB session to
+        //    spuriously close the constituents WS several times per
+        //    hour during normal market activity. Per `socket.rs`,
+        //    `last_alive` is only updated on inbound stream messages,
+        //    so a 10 s lull on a sparse-tick slot trips the timeout
+        //    even though the underlying socket is healthy. 15/30 s
+        //    matches the cadence of Upstox's own market-info
+        //    keepalives and tolerates brief mid-day quiet periods.
+        let mut socket_config = SocketConfig::default();
+        socket_config.heartbeat = Duration::from_secs(15);
+        socket_config.timeout = Duration::from_secs(30);
+        let config: ClientConfig = ClientConfig::new(Url::parse(&authorized_url).unwrap())
+            .max_initial_connect_attempts(1)
+            .socket_config(socket_config);
         // Share an `is_open` flag between the slot's `ClientExt` and
         // the pool entry. The flag stays `false` until ezsockets
         // dispatches `on_connect` (TLS + WS upgrade complete) and

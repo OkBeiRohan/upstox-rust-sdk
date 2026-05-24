@@ -371,6 +371,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         sync::Arc,
+        time::{Duration, Instant},
     },
     tokio::{
         sync::{Mutex, MutexGuard},
@@ -607,17 +608,54 @@ impl ApiClient {
                 tasks_vec.push(portfolio_feed_task);
             }
 
-            // One WS per `WsChannelConfig` entry. The order is preserved
-            // so operators can see slot 0 -> 1 -> 2 -> 3 -> 4 handshakes
-            // in a deterministic sequence in the logs.
+            // One WS per `WsChannelConfig` entry. Connections are
+            // STAGGERED — we wait for each slot's WS handshake to
+            // finish (or time out) before issuing the next connect.
+            //
+            // Why stagger: the 2026-05-12 NOB session showed Upstox
+            // throttles a single account that opens 3+ WSes in rapid
+            // succession (<100 ms apart). Symptoms: only 1 of 5 slot
+            // handshakes completes; the other 4 actor tasks loop on
+            // a single-use auth URL that the broker has already
+            // rejected, never recovering until the supervisor
+            // (`reconnect_market_data_by_id`) drops the dead pool
+            // entry and fetches a fresh URL. Confirmed by community
+            // threads — Plus users report consistent failures past
+            // 3 simultaneous connections even though the documented
+            // cap is 5.
+            //
+            // Sequential boot trades a small extra latency
+            // (~`PER_SLOT_OPEN_BUDGET_MS` × N) for a much higher
+            // success rate on the first try. A slot that doesn't
+            // open within the budget is left as a "best-effort"
+            // task — its actor task keeps the slot's `is_open`
+            // flag at false; the supervisor's watchdog will drive
+            // a reconnect with a fresh URL when it next polls.
             //
             // Reject duplicate slot ids up front — two callbacks for
             // the same pool id would lose the first callback silently
             // (the second call would error with "slot already
             // connected") or race depending on ordering.
+            //
+            // Per-slot wait budget: long enough for a cold CloudFront
+            // PoP TLS+WS handshake (~1-3 s) plus a brief Upstox-side
+            // accept window. Bigger budgets push the whole 5-slot
+            // boot past `PreMarket → MarketOpen` if Upstox is fully
+            // throttled — the watchdog handles those slots in the
+            // background instead.
+            const PER_SLOT_OPEN_BUDGET: Duration = Duration::from_secs(8);
+            const POLL_INTERVAL: Duration = Duration::from_millis(100);
+            // Spacing between connect calls (skipped on the first).
+            // Gives Upstox's anti-abuse layer a clear "this is one
+            // user opening sequential connections, not a flood" signal.
+            const INTER_CONNECT_DELAY: Duration = Duration::from_millis(750);
+
             let mut seen_slots: Vec<usize> =
                 Vec::with_capacity(ws_connect_config.market_data_streams.len());
-            for channel in ws_connect_config.market_data_streams {
+            let total_slots = ws_connect_config.market_data_streams.len();
+            for (idx, channel) in
+                ws_connect_config.market_data_streams.into_iter().enumerate()
+            {
                 if !channel.connection.is_valid() {
                     return Err(format!(
                         "WsChannelConfig slot {} out of range (max {MAX_MARKET_DATA_CONNECTIONS})",
@@ -631,10 +669,70 @@ impl ApiClient {
                     ));
                 }
                 seen_slots.push(channel.connection.0);
+
+                if idx > 0 {
+                    tokio::time::sleep(INTER_CONNECT_DELAY).await;
+                }
+
+                let slot_id = channel.connection.0;
                 let task = api_client
                     .connect_market_data_feed_v3(channel.connection, channel.callback)
                     .await?;
                 tasks_vec.push(task);
+                // Borrow the just-pushed task so the wait loop can
+                // bail out early if the actor exits (which happens
+                // immediately under `max_initial_connect_attempts(1)`
+                // when Upstox rejects the handshake — no point
+                // burning the rest of the per-slot budget polling
+                // an `is_open` flag the dead actor will never flip).
+                let task_handle = tasks_vec
+                    .last()
+                    .expect("just pushed; tasks_vec is non-empty");
+
+                let wait_start = Instant::now();
+                let mut opened = false;
+                let mut actor_died = false;
+                while wait_start.elapsed() < PER_SLOT_OPEN_BUDGET {
+                    if api_client.is_market_data_connected(channel.connection) {
+                        opened = true;
+                        break;
+                    }
+                    if task_handle.is_finished() {
+                        actor_died = true;
+                        break;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                if opened {
+                    info!(
+                        slot = slot_id,
+                        index = idx + 1,
+                        total = total_slots,
+                        elapsed_ms = wait_start.elapsed().as_millis() as u64,
+                        "market-data WS slot opened during boot stagger"
+                    );
+                } else if actor_died {
+                    tracing::warn!(
+                        slot = slot_id,
+                        index = idx + 1,
+                        total = total_slots,
+                        elapsed_ms = wait_start.elapsed().as_millis() as u64,
+                        "market-data WS slot actor exited before handshake \
+                         completed (Upstox likely throttled this connection) \
+                         — supervisor watchdog will reconnect with a fresh \
+                         auth URL on its next cycle"
+                    );
+                } else {
+                    tracing::warn!(
+                        slot = slot_id,
+                        index = idx + 1,
+                        total = total_slots,
+                        budget_ms = PER_SLOT_OPEN_BUDGET.as_millis() as u64,
+                        "market-data WS slot did NOT open within boot-stagger \
+                         budget (actor still running; handshake in progress \
+                         or stuck) — supervisor watchdog will check later"
+                    );
+                }
             }
         }
 

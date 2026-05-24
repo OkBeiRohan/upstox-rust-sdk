@@ -1,0 +1,65 @@
+name: Auto-assign
+
+# Routes new issues + PRs to the right assignee.
+#   @goldr0g3r    — default assignee for all issues + PRs
+#   @OkBeiRohan   — ALWAYS requested as PR reviewer (no exceptions)
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, ready_for_review, reopened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+env:
+  REVIEWER: OkBeiRohan
+  DEV_ASSIGNEE: goldr0g3r
+
+jobs:
+  route:
+    name: Route assignee + request reviewer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine context
+        id: ctx
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "kind=issue" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "kind=pr" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Assign issue
+        if: steps.ctx.outputs.kind == 'issue'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue edit "${{ steps.ctx.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --add-assignee "$DEV_ASSIGNEE"
+
+      - name: Assign PR + request reviewer
+        if: steps.ctx.outputs.kind == 'pr'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.ctx.outputs.number }}"
+          # 1) Set assignee
+          gh pr edit "$PR_NUM" \
+            --repo "${{ github.repository }}" \
+            --add-assignee "$DEV_ASSIGNEE"
+
+          # 2) Request @OkBeiRohan as reviewer (skip if self-authored)
+          PR_AUTHOR='${{ github.event.pull_request.user.login }}'
+          if [ "$PR_AUTHOR" != "$REVIEWER" ]; then
+            gh pr edit "$PR_NUM" \
+              --repo "${{ github.repository }}" \
+              --add-reviewer "$REVIEWER"
+          else
+            echo "PR opened by $REVIEWER; skipping self-review request."
+          fi

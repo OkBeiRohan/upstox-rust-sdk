@@ -1,0 +1,26 @@
+name: Add to project
+
+# Auto-adds every newly opened issue + PR to the Upstox Rust SDK project board.
+# NOTE: Update the project-url below after creating the project.
+# The PROJECTS_PAT secret must have `project` + `read:org` scopes.
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  issues: read
+  pull-requests: read
+
+jobs:
+  add-to-project:
+    name: Add to project board
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v1.0.2
+        with:
+          # TODO: Update this URL after creating the project in Part 2
+          project-url: https://github.com/users/OkBeiRohan/projects/6
+          github-token: ${{ secrets.PROJECTS_PAT }}

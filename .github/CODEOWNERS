@@ -1,0 +1,39 @@
+# CODEOWNERS — review-request routing for upstox-rust-sdk.
+#
+# Roster (2026-05-24):
+#   @OkBeiRohan   — ALWAYS REVIEWER FOR EVERYTHING (final approver)
+#   @goldr0g3r    — Development review (primary assignee for all technical work)
+#
+# Rules:
+#   - @OkBeiRohan is on every line (always reviewer).
+#   - @goldr0g3r is added for all code paths.
+
+# -------------------------------------------------------------------------
+# Default — every path
+# -------------------------------------------------------------------------
+* @OkBeiRohan @goldr0g3r
+
+# -------------------------------------------------------------------------
+# Core SDK modules — highest review priority
+# -------------------------------------------------------------------------
+/src/client.rs       @OkBeiRohan @goldr0g3r
+/src/rate_limiter.rs @OkBeiRohan @goldr0g3r
+/src/ws_client.rs    @OkBeiRohan @goldr0g3r
+
+# -------------------------------------------------------------------------
+# API implementations
+# -------------------------------------------------------------------------
+/src/apis/           @OkBeiRohan @goldr0g3r
+
+# -------------------------------------------------------------------------
+# Data models
+# -------------------------------------------------------------------------
+/src/models/         @OkBeiRohan @goldr0g3r
+
+# -------------------------------------------------------------------------
+# Build + CI + GitHub config
+# -------------------------------------------------------------------------
+/Cargo.toml          @OkBeiRohan @goldr0g3r
+/Cargo.lock          @OkBeiRohan @goldr0g3r
+/build.rs            @OkBeiRohan @goldr0g3r
+/.github/            @OkBeiRohan @goldr0g3r

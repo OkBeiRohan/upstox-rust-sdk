@@ -1,0 +1,120 @@
+name: Merge on @OkBeiRohan approval
+
+# Workflow-based substitute for branch protection (paywalled on free private repos).
+# Squash-merges PRs once gate conditions are met.
+#
+# Gate logic:
+#   - PR author == @OkBeiRohan → skip approval check (self-authored = implicit approval)
+#   - PR author != @OkBeiRohan → require @OkBeiRohan's APPROVED review
+#   - CI must be green + PR must be mergeable + base=main + non-draft
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: write
+  checks: read
+
+env:
+  REVIEWER: OkBeiRohan
+
+jobs:
+  maybe-merge:
+    name: Merge if approved + CI green
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved' &&
+       github.event.review.user.login == 'OkBeiRohan') ||
+      (github.event_name == 'check_suite' &&
+       github.event.check_suite.conclusion == 'success' &&
+       github.event.check_suite.pull_requests[0] != null) ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.user.login == 'OkBeiRohan')
+    steps:
+      - name: Identify the PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request_review|pull_request)
+              PR_NUM="${{ github.event.pull_request.number }}"
+              ;;
+            check_suite)
+              PR_NUM="${{ github.event.check_suite.pull_requests[0].number }}"
+              ;;
+            *)
+              echo "Unexpected event: ${{ github.event_name }}"
+              exit 1
+              ;;
+          esac
+          echo "number=$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Check approval + CI states
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.pr.outputs.number }}"
+          REPO="${{ github.repository }}"
+
+          PR_JSON=$(gh pr view "$PR_NUM" --repo "$REPO" \
+            --json author,reviews,mergeable,mergeStateStatus,statusCheckRollup,state,isDraft,baseRefName)
+
+          IS_DRAFT=$(echo "$PR_JSON" | jq -r '.isDraft')
+          STATE=$(echo "$PR_JSON" | jq -r '.state')
+          BASE=$(echo "$PR_JSON" | jq -r '.baseRefName')
+          AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
+          if [ "$IS_DRAFT" = "true" ] || [ "$STATE" != "OPEN" ] || [ "$BASE" != "main" ]; then
+            echo "Skipping: draft=$IS_DRAFT state=$STATE base=$BASE"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$AUTHOR" = "$REVIEWER" ]; then
+            echo "Self-authored by $REVIEWER — implicit approval."
+          else
+            LATEST_REVIEW_STATE=$(echo "$PR_JSON" | jq -r --arg user "$REVIEWER" \
+              '[.reviews[] | select(.author.login == $user)] | sort_by(.submittedAt) | last | .state // "NONE"')
+
+            if [ "$LATEST_REVIEW_STATE" != "APPROVED" ]; then
+              echo "Skipping: $REVIEWER has not approved (state=$LATEST_REVIEW_STATE)."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          BAD_CHECKS=$(echo "$PR_JSON" | jq -r \
+            '[.statusCheckRollup[]? | select(((.conclusion // .state) | ascii_downcase) as $s | $s != "success" and $s != "neutral" and $s != "skipped")] | length')
+          if [ "$BAD_CHECKS" -gt 0 ]; then
+            echo "Skipping: CI not green ($BAD_CHECKS check(s) pending/failing)."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
+          if [ "$MERGEABLE" != "MERGEABLE" ]; then
+            echo "Skipping: PR not mergeable (mergeable=$MERGEABLE)."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "GO — merging PR #$PR_NUM"
+
+      - name: Squash-merge + delete branch
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.pr.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --squash \
+            --delete-branch
