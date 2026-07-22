@@ -35,7 +35,7 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::task::JoinHandle,
 };
@@ -146,6 +146,39 @@ pub const ALL_WS_CONNECTION_ROLES: [WsConnectionRole; MAX_MARKET_DATA_CONNECTION
     WsConnectionRole::OptionsChainFull,
     WsConnectionRole::IndicesLtpc,
     WsConnectionRole::ExpansionFull,
+];
+
+/// Boot-time connect PRIORITY order (distinct from id-order).
+///
+/// The staggered boot in [`ApiClient::new_with_capabilities`] opens
+/// sockets one at a time and Upstox intermittently throttles a single
+/// account past ~3 simultaneous connections — so the last slots in the
+/// connect sequence are the ones most likely to be rejected and left
+/// dead (the 2026-07-22 NOB session lost exactly the tail two:
+/// `indices_ltpc` and `expansion_full`).
+///
+/// This orders the connects by DATA VALUE so the most important feeds
+/// win the earliest, most-reliable connection slots:
+///
+/// 1. `IndicesLtpc` — Nifty/BankNifty/VIX spot. A frozen index feed
+///    silently poisons every index-derived feature (`vix_level`,
+///    `cumulative_return_from_open`, `nifty_rsi_14_1m`, …), so it must
+///    never be a tail victim again.
+/// 2. `ExecutionZoneD30` — futures + ATM options (the tradeable core).
+/// 3. `ConstituentsD30` — Nifty 50 constituents.
+/// 4. `ExpansionFull` — ATM-ring expansion.
+/// 5. `OptionsChainFull` — the sparse far-OTM chain, least sensitive
+///    to a slow/late open (it ticks sparsely anyway).
+///
+/// Pool ids are UNCHANGED — this only reorders the connect sequence,
+/// not the `role.id()` → pool-index mapping that callback wiring and
+/// the slot pool depend on.
+pub const WS_BOOT_CONNECT_ORDER: [WsConnectionRole; MAX_MARKET_DATA_CONNECTIONS] = [
+    WsConnectionRole::IndicesLtpc,
+    WsConnectionRole::ExecutionZoneD30,
+    WsConnectionRole::ConstituentsD30,
+    WsConnectionRole::ExpansionFull,
+    WsConnectionRole::OptionsChainFull,
 ];
 
 /// Boxed callback signature used for all five market-data pools. Extracted
@@ -558,6 +591,226 @@ impl ApiClient {
         self.reconnect_market_data_by_id(role.id(), callback).await
     }
 
+    /// Reconnect a dead slot with **bounded retry + exponential
+    /// backoff + jitter**, waiting for each attempt's WS handshake to
+    /// actually complete before declaring success.
+    ///
+    /// # Why this exists (2026-07-22 slot-3/4 permanent-failure bug)
+    ///
+    /// [`Self::connect_market_data_feed_v3`] builds every socket with
+    /// `max_initial_connect_attempts(1)`, so ezsockets makes exactly
+    /// ONE handshake attempt and, on failure, the actor exits with
+    /// `"failed to connect after 1 attempt(s), aborting..."`. That cap
+    /// is correct for the *in-actor* auto-reconnect (Upstox's auth URL
+    /// is single-use — retrying the same URL is guaranteed to fail),
+    /// but it makes a single transient rejection TERMINAL for the
+    /// whole reconnect. On 2026-07-22 an intermittent Upstox
+    /// concurrent-connection throttle knocked out the two tail slots
+    /// (`indices_ltpc`, `expansion_full`) and the single-attempt
+    /// reconnect could never win them back — the slots stayed dead for
+    /// the entire session.
+    ///
+    /// The fix: retry at the SDK level, where each
+    /// [`Self::reconnect_market_data_by_id`] call fetches a **fresh**
+    /// single-use auth URL. That sidesteps the URL-reuse hazard the
+    /// `max_initial_connect_attempts(1)` cap was guarding against —
+    /// every attempt here is a clean, independently-authorized connect.
+    ///
+    /// `make_callback` is a FACTORY, not a callback: the callback box
+    /// (`Box<dyn FnMut>`) is consumed by `ezsockets::connect` on each
+    /// attempt, so a retry needs a fresh one. It is invoked once per
+    /// attempt.
+    ///
+    /// Returns the live actor `JoinHandle` once a handshake completes
+    /// (slot reports [`Self::is_market_data_connected`] within
+    /// `per_attempt_open_timeout`). Returns `Err` only after all
+    /// `max_attempts` are exhausted. Backoff between attempts is
+    /// `base_backoff * 2^(attempt-1)` capped at `max_backoff`, plus up
+    /// to 25% additive jitter so multiple slots recovering in parallel
+    /// don't re-synchronise into a burst Upstox would throttle.
+    pub async fn reconnect_market_data_by_id_with_backoff(
+        &mut self,
+        conn: WsConnectionId,
+        mut make_callback: impl FnMut() -> Option<MarketDataFeedV3CallbackBox>,
+        max_attempts: u32,
+        base_backoff: Duration,
+        max_backoff: Duration,
+        per_attempt_open_timeout: Duration,
+    ) -> Result<JoinHandle<()>, String> {
+        if !conn.is_valid() {
+            return Err(format!(
+                "WsConnectionId {} is out of range (max {MAX_MARKET_DATA_CONNECTIONS})",
+                conn.0
+            ));
+        }
+        let max_attempts = max_attempts.max(1);
+        let mut last_err = String::from("no attempt made");
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        for attempt in 1..=max_attempts {
+            let callback = make_callback();
+            match self.reconnect_market_data_by_id(conn, callback).await {
+                Ok(handle) => {
+                    // The connect call returns the moment the handle is
+                    // stored; the TLS + WS-upgrade completes on the
+                    // spawned actor. Poll `is_open` (bailing early if
+                    // the actor dies — the single-attempt cap means a
+                    // rejected handshake finishes almost immediately)
+                    // so we only report success on a genuinely-open
+                    // socket.
+                    let start = std::time::Instant::now();
+                    let mut opened = false;
+                    while start.elapsed() < per_attempt_open_timeout {
+                        if self.is_market_data_connected(conn) {
+                            opened = true;
+                            break;
+                        }
+                        if handle.is_finished() {
+                            break;
+                        }
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                    }
+                    if opened {
+                        tracing::info!(
+                            slot = conn.0,
+                            attempt,
+                            max_attempts,
+                            waited_ms = start.elapsed().as_millis() as u64,
+                            "market-data slot reconnected with backoff"
+                        );
+                        return Ok(handle);
+                    }
+                    last_err = format!(
+                        "slot {} handshake did not open within {} ms on attempt {attempt}",
+                        conn.0,
+                        per_attempt_open_timeout.as_millis(),
+                    );
+                    tracing::warn!(
+                        slot = conn.0,
+                        attempt,
+                        max_attempts,
+                        actor_died = handle.is_finished(),
+                        "{last_err}"
+                    );
+                    // Explicitly tear the half-open socket down before
+                    // the next attempt. A lingering not-yet-open socket
+                    // still counts against Upstox's concurrent-connection
+                    // limit — the exact throttle this retry is fighting —
+                    // so we free the credit now instead of waiting for
+                    // the handle to drop. The next
+                    // `reconnect_market_data_by_id` would clear the pool
+                    // entry anyway; this just also sends the close frame.
+                    self.disconnect_market_data_by_id(conn);
+                }
+                Err(e) => {
+                    last_err = e;
+                    tracing::warn!(
+                        slot = conn.0,
+                        attempt,
+                        max_attempts,
+                        error = %last_err,
+                        "market-data slot reconnect attempt failed"
+                    );
+                }
+            }
+
+            if attempt < max_attempts {
+                let backoff = Self::backoff_with_jitter(base_backoff, max_backoff, attempt);
+                tokio::time::sleep(backoff).await;
+            }
+        }
+
+        Err(format!(
+            "slot {} reconnect exhausted {max_attempts} attempt(s); last error: {last_err}",
+            conn.0
+        ))
+    }
+
+    /// Convenience wrapper: retrying reconnect by [`WsConnectionRole`].
+    pub async fn reconnect_market_data_by_role_with_backoff(
+        &mut self,
+        role: WsConnectionRole,
+        make_callback: impl FnMut() -> Option<MarketDataFeedV3CallbackBox>,
+        max_attempts: u32,
+        base_backoff: Duration,
+        max_backoff: Duration,
+        per_attempt_open_timeout: Duration,
+    ) -> Result<JoinHandle<()>, String> {
+        self.reconnect_market_data_by_id_with_backoff(
+            role.id(),
+            make_callback,
+            max_attempts,
+            base_backoff,
+            max_backoff,
+            per_attempt_open_timeout,
+        )
+        .await
+    }
+
+    /// Exponential backoff for attempt `n` (1-based), capped at
+    /// `max_backoff`, plus up to 25% additive jitter.
+    ///
+    /// Jitter source is the process wall clock's sub-second nanos — no
+    /// `rand` dependency, and good enough to de-correlate two slots
+    /// that would otherwise retry in lockstep (their calls are already
+    /// microseconds apart, which the nanos component amplifies).
+    fn backoff_with_jitter(base: Duration, max_backoff: Duration, attempt: u32) -> Duration {
+        // `base * 2^(attempt-1)`, saturating so a large attempt count
+        // can't overflow the multiply.
+        let shift = attempt.saturating_sub(1).min(16);
+        let scaled = base
+            .checked_mul(1u32 << shift)
+            .unwrap_or(max_backoff)
+            .min(max_backoff);
+        let jitter_span_ms = (scaled.as_millis() as u64) / 4; // up to 25%
+        let jitter_ms = if jitter_span_ms == 0 {
+            0
+        } else {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            nanos % (jitter_span_ms + 1)
+        };
+        scaled + Duration::from_millis(jitter_ms)
+    }
+
+    /// Tear down a single market-data slot: send a close frame to the
+    /// server (best-effort) and drop the pool entry so the slot reads
+    /// as fully disconnected. Idempotent — a no-op on an empty slot.
+    pub fn disconnect_market_data_by_id(&mut self, conn: WsConnectionId) {
+        if !conn.is_valid() {
+            return;
+        }
+        if let Some(entry) = self.market_data_feed_v3_clients[conn.0].take() {
+            // Best-effort close frame; ignore the result — if the
+            // socket is already dead the send just fails harmlessly.
+            let _ = entry.handle.close(None);
+            entry.is_open.store(false, Ordering::Release);
+        }
+    }
+
+    /// Tear down EVERY market-data slot at once.
+    ///
+    /// # Why (2026-07-22 concurrent-throttle recovery)
+    ///
+    /// When Upstox throttles a single account past ~3 simultaneous
+    /// connections, a per-slot reconnect of a dead tail slot is always
+    /// a request for a 4th/5th LIVE connection and gets rejected every
+    /// time — the healthy slots holding those connection credits are
+    /// exactly what blocks the dead ones from recovering. The only way
+    /// out of that deadlock is to drop ALL sockets and re-race the
+    /// whole pool from zero (via the staggered
+    /// [`Self::reconnect_market_data_by_id_with_backoff`] on each slot,
+    /// or the boot path). This method is the teardown half of that
+    /// coordinated cold restart; the caller re-opens the slots
+    /// afterwards in [`WS_BOOT_CONNECT_ORDER`] priority.
+    pub fn disconnect_all_market_data(&mut self) {
+        for idx in 0..MAX_MARKET_DATA_CONNECTIONS {
+            self.disconnect_market_data_by_id(WsConnectionId(idx));
+        }
+    }
+
     /// Convenience wrapper — open the physical slot this role maps to
     /// via [`WsConnectionRole::id`].
     pub async fn connect_market_data_by_role(
@@ -825,9 +1078,50 @@ mod tests {
     }
 
     #[test]
+    fn ws_boot_connect_order_is_a_permutation_with_indices_first() {
+        // Same set as the id-ordered array, just a different sequence.
+        let mut boot_ids: Vec<usize> =
+            WS_BOOT_CONNECT_ORDER.iter().map(|r| r.id().0).collect();
+        boot_ids.sort_unstable();
+        assert_eq!(boot_ids, (0..MAX_MARKET_DATA_CONNECTIONS).collect::<Vec<_>>());
+        // Index spot must lead so a connect-count throttle never
+        // sacrifices the index feed (2026-07-22 regression guard).
+        assert_eq!(WS_BOOT_CONNECT_ORDER[0], WsConnectionRole::IndicesLtpc);
+        // The sparse far-OTM chain is the acceptable tail victim.
+        assert_eq!(
+            WS_BOOT_CONNECT_ORDER[MAX_MARKET_DATA_CONNECTIONS - 1],
+            WsConnectionRole::OptionsChainFull
+        );
+    }
+
+    #[test]
     fn max_connections_matches_upstox_plus_spec() {
         assert_eq!(MAX_MARKET_DATA_CONNECTIONS, 5);
         assert_eq!(MAX_MARKET_DATA_CONNECTIONS_STANDARD, 2);
+    }
+
+    #[test]
+    fn backoff_with_jitter_grows_exponentially_and_caps() {
+        let base = Duration::from_millis(500);
+        let max = Duration::from_secs(8);
+        // Attempt 1 -> base (500ms) + up to 25% jitter (<=125ms).
+        let a1 = ApiClient::backoff_with_jitter(base, max, 1);
+        assert!(a1 >= base && a1 <= base + Duration::from_millis(125), "a1={a1:?}");
+        // Attempt 2 -> 2x base (1000ms) + up to 250ms jitter.
+        let a2 = ApiClient::backoff_with_jitter(base, max, 2);
+        assert!(
+            a2 >= Duration::from_millis(1000) && a2 <= Duration::from_millis(1250),
+            "a2={a2:?}"
+        );
+        // Attempt 3 -> 4x base (2000ms) + up to 500ms.
+        let a3 = ApiClient::backoff_with_jitter(base, max, 3);
+        assert!(
+            a3 >= Duration::from_millis(2000) && a3 <= Duration::from_millis(2500),
+            "a3={a3:?}"
+        );
+        // A large attempt saturates at max_backoff (+ up to 25% jitter).
+        let big = ApiClient::backoff_with_jitter(base, max, 20);
+        assert!(big >= max && big <= max + max / 4, "big={big:?}");
     }
 
     #[test]
