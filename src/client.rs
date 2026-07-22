@@ -650,11 +650,31 @@ impl ApiClient {
             // user opening sequential connections, not a flood" signal.
             const INTER_CONNECT_DELAY: Duration = Duration::from_millis(750);
 
+            // Connect in DATA-VALUE priority order, not the order the
+            // caller happened to list the channels in. Upstox
+            // intermittently throttles a single account past ~3
+            // simultaneous connections, so whichever slots land at the
+            // TAIL of this staggered sequence are the ones most likely
+            // to be rejected and left dead (the 2026-07-22 NOB session
+            // lost exactly the tail two). `WS_BOOT_CONNECT_ORDER` puts
+            // the index-spot feed first so a throttle sacrifices the
+            // sparse far-OTM chain — the least time-sensitive slot —
+            // instead of the index feed that every index-derived
+            // feature depends on. Channels whose slot id isn't in the
+            // priority list (custom layouts) sort last, in their
+            // original relative order (stable sort).
+            let mut market_data_streams = ws_connect_config.market_data_streams;
+            market_data_streams.sort_by_key(|channel| {
+                crate::ws_client::WS_BOOT_CONNECT_ORDER
+                    .iter()
+                    .position(|role| role.id().0 == channel.connection.0)
+                    .unwrap_or(usize::MAX)
+            });
+
             let mut seen_slots: Vec<usize> =
-                Vec::with_capacity(ws_connect_config.market_data_streams.len());
-            let total_slots = ws_connect_config.market_data_streams.len();
-            for (idx, channel) in
-                ws_connect_config.market_data_streams.into_iter().enumerate()
+                Vec::with_capacity(market_data_streams.len());
+            let total_slots = market_data_streams.len();
+            for (idx, channel) in market_data_streams.into_iter().enumerate()
             {
                 if !channel.connection.is_valid() {
                     return Err(format!(

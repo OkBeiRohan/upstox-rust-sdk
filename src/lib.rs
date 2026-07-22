@@ -19,5 +19,5 @@ pub use rate_limiter::{RateLimitBucket, RateLimitExceeded, RateLimitProfile};
 pub use ws_client::{
     ALL_WS_CONNECTION_ROLES, MAX_MARKET_DATA_CONNECTIONS, MAX_MARKET_DATA_CONNECTIONS_STANDARD,
     MarketDataFeedV3CallbackBox, MarketDataFeedV3ClientPool, MarketDataFeedV3EzClient,
-    MarketDataV3Call, WsConnectionId, WsConnectionRole,
+    MarketDataV3Call, WS_BOOT_CONNECT_ORDER, WsConnectionId, WsConnectionRole,
 };
